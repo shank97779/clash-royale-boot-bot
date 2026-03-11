@@ -10,11 +10,17 @@ import argparse
 import os
 import sys
 import sqlite3
+import time
 import requests
 from datetime import date, datetime
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Fix timezone so midnight == 10:00am UTC == Clash game day reset.
+# Etc/GMT+10 is POSIX notation for UTC-10 (signs are inverted in POSIX).
+os.environ["TZ"] = "Etc/GMT+10"
+time.tzset()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 CLAN_TAG        = os.getenv("CLAN_TAG",         "#PJ8Q8P")   # BornGifted tag
@@ -575,35 +581,142 @@ def send_discord_report(
             f"{len(boat_offenders)} boat offender(s), out of {member_count} members)."
         )
 
+# ── Replay from DB ────────────────────────────────────────────────────────────
+
+def load_snapshot_from_db(conn: sqlite3.Connection, target_date: str) -> dict:
+    """
+    Reconstructs participants, members, and period metadata from saved DB rows
+    for target_date.  Used by --date replay mode (no API calls made).
+    """
+    rows = conn.execute(
+        """
+        SELECT player_tag, player_name, period_type, section_index, period_index,
+               fame, repair_points, boat_attacks, decks_used, decks_used_today
+        FROM snapshots
+        WHERE snapshot_date = ?
+        """,
+        (target_date,),
+    ).fetchall()
+
+    if not rows:
+        sys.exit(
+            f"Error: No race snapshot found for {target_date}. "
+            "Only dates that have already been fetched can be replayed."
+        )
+
+    participants = [
+        {
+            "tag":            r["player_tag"],
+            "name":           r["player_name"],
+            "fame":           r["fame"],
+            "repairPoints":   r["repair_points"],
+            "boatAttacks":    r["boat_attacks"],
+            "decksUsed":      r["decks_used"],
+            "decksUsedToday": r["decks_used_today"],
+        }
+        for r in rows
+    ]
+
+    mem_rows = conn.execute(
+        """
+        SELECT player_tag, player_name, role, exp_level, trophies, donations, last_seen
+        FROM member_snapshots
+        WHERE snapshot_date = ?
+        """,
+        (target_date,),
+    ).fetchall()
+
+    if not mem_rows:
+        sys.exit(f"Error: No member snapshot found for {target_date}.")
+
+    members = [
+        {
+            "tag":      r["player_tag"],
+            "name":     r["player_name"],
+            "role":     r["role"],
+            "expLevel": r["exp_level"],
+            "trophies": r["trophies"],
+            "donations":r["donations"],
+            "lastSeen": r["last_seen"],
+        }
+        for r in mem_rows
+    ]
+
+    return {
+        "period_type":   rows[0]["period_type"],
+        "section_index": rows[0]["section_index"],
+        "period_index":  rows[0]["period_index"],
+        "participants":  participants,
+        "members":       members,
+    }
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     global VERBOSE
     parser = argparse.ArgumentParser(description="Clash Royale Boot Bot")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print detailed progress logging")
+    parser.add_argument(
+        "--date", "-d",
+        metavar="YYYY-MM-DD",
+        help="Replay a historical date using saved DB snapshots (no API calls made)",
+    )
     args = parser.parse_args()
     VERBOSE = args.verbose
 
-    if not API_TOKEN:
-        sys.exit("Error: CR_API_TOKEN is not set. Copy .env.example to .env and fill it in.")
+    if args.date:
+        try:
+            date.fromisoformat(args.date)
+        except ValueError:
+            sys.exit(f"Error: --date must be YYYY-MM-DD, got '{args.date}'.")
+        today = args.date
+    else:
+        today = date.today().isoformat()
 
-    today = date.today().isoformat()
-    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] Fetching river race data for {CLAN_TAG} …")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    data    = fetch_river_race()
-    members = fetch_members()
+    # ── Load data — either live from API or replayed from DB ───────────────────
+    if args.date:
+        print(f"[{now}] Replaying saved snapshot for {today} (no API calls) …")
+        with get_db() as conn:
+            init_db(conn)
+            snapped       = load_snapshot_from_db(conn, today)
+            prior_tags    = get_prior_tags(conn, today)
+            vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
+            candidates    = find_boot_candidates(
+                conn, today, snapped["period_type"], snapped["participants"], snapped["members"], prior_tags
+            )
+        participants  = snapped["participants"]
+        members       = snapped["members"]
+        clan_name     = CLAN_TAG
+        period_type   = snapped["period_type"]
+        section_index = snapped["section_index"]
+        period_index  = snapped["period_index"]
+    else:
+        if not API_TOKEN:
+            sys.exit("Error: CR_API_TOKEN is not set. Copy .env.example to .env and fill it in.")
+        print(f"[{now}] Fetching river race data for {CLAN_TAG} …")
+        data    = fetch_river_race()
+        members = fetch_members()
+        clan_info     = data.get("clan", {})
+        clan_name     = clan_info.get("name", CLAN_TAG)
+        participants  = clan_info.get("participants", [])
+        period_type   = data.get("periodType", "unknown")
+        section_index = data.get("sectionIndex", 0)
+        period_index  = data.get("periodIndex", 0)
+        with get_db() as conn:
+            init_db(conn)
+            prior_tags = get_prior_tags(conn, today)
+            vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
+            store_snapshot(conn, today, period_type, section_index, period_index, participants)
+            store_members_snapshot(conn, today, members)
+            candidates = find_boot_candidates(
+                conn, today, period_type, participants, members, prior_tags
+            )
 
-    clan_info     = data.get("clan", {})
-    clan_name     = clan_info.get("name", CLAN_TAG)
-    participants  = clan_info.get("participants", [])
-    period_type   = data.get("periodType", "unknown")
-    section_index = data.get("sectionIndex", 0)
-    period_index  = data.get("periodIndex", 0)
-
-    # Active members = current roster tags (filters out ex-members still in race data)
-    active_tags   = {m["tag"] for m in members}
-    member_count  = len(members)
+    # ── Shared post-load logic ─────────────────────────────────────────────────
+    active_tags  = {m["tag"] for m in members}
+    member_count = len(members)
 
     print(
         f"  Clan: {clan_name}  |  Active members: {member_count}"
@@ -624,16 +737,6 @@ def main() -> None:
                 f"  [v]   {m['name']:<20} ({m['tag']:<12}) [{m.get('role','?'):<9}]"
                 f"  fame={fame:<6}  decks={decks_total} today={decks_today}  {in_race}"
             )
-
-    with get_db() as conn:
-        init_db(conn)
-        prior_tags = get_prior_tags(conn, today)
-        vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
-        store_snapshot(conn, today, period_type, section_index, period_index, participants)
-        store_members_snapshot(conn, today, members)
-        candidates = find_boot_candidates(
-            conn, today, period_type, participants, members, prior_tags
-        )
 
     top            = find_top_performers(participants, active_tags) if period_type == "warDay" else {}
     boat_offenders = find_boat_offenders(participants, active_tags) if (period_type == "warDay" and REPORT_BOAT_ATTACKS) else []
