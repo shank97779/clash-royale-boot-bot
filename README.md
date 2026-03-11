@@ -14,6 +14,14 @@ Every run (typically once per day via cron):
 4. On **war days**, evaluates each member who has been in the clan for at least one prior day and flags anyone who is under-participating.
 5. Posts the results to Discord.
 
+### Top performers shoutout (war days only)
+
+After boot evaluation, the top `TOP_PERFORMERS_N` distinct fame tiers are identified. Every player tied at a given tier earns the same medal. Within a tier, players are sorted by fewest decks used (most efficient first). The shoutout is posted as a gold embed in Discord — good for morale!
+
+### Boat attack shaming (war days only)
+
+Boat attacks earn only **125 fame per tower** hit, compared to **200 fame** for a regular battle win or **250 fame** for a dual-battle win. Any member who used boat attacks during the race is called out in an orange embed so they know to switch strategy. Set `REPORT_BOAT_ATTACKS=false` to disable this.
+
 ### Boot / demotion rules (war days only)
 
 | Role | Action |
@@ -67,6 +75,9 @@ Edit `.env`:
 | `DB_PATH` | Path to the SQLite database file | `bootbot.db` |
 | `MIN_DECKS_PER_DAY` | Expected deck uses per war day | `4` |
 | `MIN_PARTICIPATION_PCT` | Flag if cumulative usage is below this fraction of expected | `0.5` |
+| `MIN_CLAN_SIZE` | Never boot members below this headcount; demotions are unaffected | `40` |
+| `TOP_PERFORMERS_N` | Number of distinct fame tiers to shoutout | `3` |
+| `REPORT_BOAT_ATTACKS` | Post an orange warning embed for members who used boat attacks | `true` |
 
 ### 4. Run manually
 
@@ -110,6 +121,9 @@ Add (runs at 4:55 AM daily):
 - **Grey embed** — training day, no evaluation.
 - **Green embed** — war day, everyone is participating.
 - **Red embed** — war day, lists each under-performing member with their recommended action, stats, and last-seen date.
+- **Yellow embed** — war day, lists members who are under-performing but are **protected from booting** because the clan is at or near `MIN_CLAN_SIZE`. They would be actioned once recruiting improves. Demotions (co-leader / elder) are never protected and always appear in the red embed.
+- **Gold embed** — top performers shoutout (up to `TOP_PERFORMERS_N` fame tiers).
+- **Orange embed** — boat attack warning for members who used boat attacks instead of regular or dual battles.
 
 ---
 

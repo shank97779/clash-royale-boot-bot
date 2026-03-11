@@ -28,6 +28,8 @@ DB_PATH         = os.getenv("DB_PATH",          "bootbot.db")
 MIN_DECKS_PER_DAY     = int(os.getenv("MIN_DECKS_PER_DAY",    "4"))
 MIN_PARTICIPATION_PCT = float(os.getenv("MIN_PARTICIPATION_PCT", "0.5"))  # 50 %
 TOP_PERFORMERS_N      = int(os.getenv("TOP_PERFORMERS_N",      "3"))
+REPORT_BOAT_ATTACKS   = os.getenv("REPORT_BOAT_ATTACKS", "true").strip().lower() == "true"
+MIN_CLAN_SIZE         = int(os.getenv("MIN_CLAN_SIZE",         "40"))  # never boot below this headcount; boot down to it by worst performers
 
 CR_API_BASE = "https://api.clashroyale.com/v1"
 
@@ -330,16 +332,16 @@ def find_top_performers(participants: list, active_tags: set) -> dict:
     active  = [p for p in participants if p["tag"] in active_tags]
     by_fame = sorted(active, key=lambda p: (-p.get("fame", 0), p.get("decksUsed", 0)))
 
-    # Build ordered list of up to 3 distinct fame values
+    # Build ordered list of up to TOP_PERFORMERS_N distinct fame values
     tiers = []  # list of (fame_value, [players])
     for p in by_fame:
         fame = p.get("fame", 0)
         if tiers and tiers[-1][0] == fame:
             tiers[-1][1].append(p)
-        elif len(tiers) < 3:
+        elif len(tiers) < TOP_PERFORMERS_N:
             tiers.append((fame, [p]))
         else:
-            break  # already have 3 distinct tiers
+            break  # already have TOP_PERFORMERS_N distinct tiers
 
     return {"tiers": tiers}
 
@@ -376,9 +378,13 @@ def _console_report(candidates: list, top: dict, boat_offenders: list, clan_name
         print("  ✓ No action required — everyone is participating.")
     else:
         for c in candidates:
-            _, action = _role_action(c["role"])
+            if c.get("safe"):
+                label = "WATCH"
+            else:
+                _, label = _role_action(c["role"])
+                label = label.upper()
             print(
-                f"  • [{action.upper()}] {c['name']} ({c['tag']}) [{c['role']}]"
+                f"  • [{label}] {c['name']} ({c['tag']}) [{c['role']}]"
                 f" | fame={c['fame']}"
                 f" | decks={c['decks_used']} (today={c['decks_used_today']})"
                 f" | war days tracked={c['prior_war_days']}"
@@ -479,6 +485,9 @@ def send_discord_report(
             })
 
         # ── Boot / all-clear embed ─────────────────────────────────────────────
+        action_candidates = [c for c in candidates if not c.get("safe")]
+        watch_candidates  = [c for c in candidates if c.get("safe")]
+
         if not candidates:
             embeds.append({
                 "title": f"River Race Report — {today}",
@@ -490,12 +499,13 @@ def send_discord_report(
                 "footer": {"text": "Clash Royale Boot Bot"},
             })
         else:
-            fields = []
-            for c in candidates:
-                role_icon, action = _role_action(c["role"])
-                last_seen_display = c["last_seen"][:8] if len(c["last_seen"]) >= 8 else c["last_seen"] or "unknown"
-                fields.append(
-                    {
+            # ── Actionable boots (red) ─────────────────────────────────────
+            if action_candidates:
+                fields = []
+                for c in action_candidates:
+                    role_icon, action = _role_action(c["role"])
+                    last_seen_display = c["last_seen"][:8] if len(c["last_seen"]) >= 8 else c["last_seen"] or "unknown"
+                    fields.append({
                         "name": f"{role_icon} {c['name']}  (`{c['tag']}`)  →  **{action}**",
                         "value": (
                             f"Fame: **{c['fame']}** | "
@@ -505,23 +515,51 @@ def send_discord_report(
                             f"Reason: {' • '.join(c['reasons'])}"
                         ),
                         "inline": False,
-                    }
-                )
-            embeds.append({
-                "title": f":warning: River Race Action Report — {today}",
-                "description": (
-                    f"**{len(candidates)}** of **{member_count}** members in **{clan_name}** "
-                    "are under-participating:\n"
-                    ":crown: **Leader** — flag for review  |  "
-                    ":shield: **Co-Leader** → Demote to Elder  |  "
-                    ":leaves: **Elder** → Demote to Member  |  "
-                    ":bust_in_silhouette: **Member** → Boot"
-                ),
-                "color": 0xFF4444,
-                "fields": fields[:25],  # Discord cap: 25 fields per embed
-                "footer": {"text": "Clash Royale Boot Bot"},
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            })
+                    })
+                embeds.append({
+                    "title": f":warning: River Race Action Report — {today}",
+                    "description": (
+                        f"**{len(action_candidates)}** of **{member_count}** members in **{clan_name}** "
+                        "are under-participating:\n"
+                        ":crown: **Leader** — flag for review  |  "
+                        ":shield: **Co-Leader** → Demote to Elder  |  "
+                        ":leaves: **Elder** → Demote to Member  |  "
+                        ":bust_in_silhouette: **Member** → Boot"
+                    ),
+                    "color": 0xFF4444,
+                    "fields": fields[:25],
+                    "footer": {"text": "Clash Royale Boot Bot"},
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                })
+
+            # ── Watch list (yellow) — protected by MIN_CLAN_SIZE ──────────
+            if watch_candidates:
+                watch_fields = []
+                for c in watch_candidates:
+                    role_icon, action = _role_action(c["role"])
+                    last_seen_display = c["last_seen"][:8] if len(c["last_seen"]) >= 8 else c["last_seen"] or "unknown"
+                    watch_fields.append({
+                        "name": f":eyes: {c['name']}  (`{c['tag']}`)  —  **Watch** _{action} if recruiting improves_",
+                        "value": (
+                            f"Fame: **{c['fame']}** | "
+                            f"Boat attacks: **{c['boat_attacks']}** | "
+                            f"Decks used: **{c['decks_used']}** (today: **{c['decks_used_today']}**) | "
+                            f"Last seen: **{last_seen_display}**\n"
+                            f"Reason: {' • '.join(c['reasons'])}"
+                        ),
+                        "inline": False,
+                    })
+                embeds.append({
+                    "title": f":eyes: Watch List — {today}",
+                    "description": (
+                        f"**{len(watch_candidates)}** under-performing member(s) are **protected** from action "
+                        f"because the clan is at or near the minimum size of **{MIN_CLAN_SIZE}**. "
+                        "They would be actioned once recruiting improves."
+                    ),
+                    "color": 0xFFCC00,
+                    "fields": watch_fields[:25],
+                    "footer": {"text": "Clash Royale Boot Bot"},
+                })
 
         payload = {"embeds": embeds}
 
@@ -529,7 +567,13 @@ def send_discord_report(
     if resp.status_code not in (200, 204):
         print(f"[Discord] Warning: HTTP {resp.status_code} — {resp.text}")
     else:
-        print(f"[Discord] Report sent ({len(candidates)} boot candidate(s), {sum(len(pl) for _, pl in top.get('tiers', []))} shoutout(s), {len(boat_offenders)} boat offender(s), out of {member_count} members).")
+        n_action = sum(1 for c in candidates if not c.get("safe"))
+        n_watch  = sum(1 for c in candidates if c.get("safe"))
+        print(
+            f"[Discord] Report sent ({n_action} actionable, {n_watch} watch-only, "
+            f"{sum(len(pl) for _, pl in top.get('tiers', []))} shoutout(s), "
+            f"{len(boat_offenders)} boat offender(s), out of {member_count} members)."
+        )
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -592,9 +636,36 @@ def main() -> None:
         )
 
     top            = find_top_performers(participants, active_tags) if period_type == "warDay" else {}
-    boat_offenders = find_boat_offenders(participants, active_tags) if period_type == "warDay" else []
+    boat_offenders = find_boat_offenders(participants, active_tags) if (period_type == "warDay" and REPORT_BOAT_ATTACKS) else []
     vlog(f"Top performers: {[(fame_val, [p['name'] for p in players]) for fame_val, players in top.get('tiers', [])]}")
     vlog(f"Boat offenders: {[p['name'] for p in boat_offenders]}")
+
+    # Demotions (co-leader, elder) don't reduce headcount — always actioned.
+    # Only outright boots (member role) are guarded by MIN_CLAN_SIZE.
+    bootable = [c for c in candidates if c["role"] == "member"]
+    max_boots = max(0, member_count - MIN_CLAN_SIZE)
+    if max_boots == 0:
+        # At or below threshold — all members are watch-only; demotions still proceed.
+        for c in candidates:
+            c["safe"] = c["role"] == "member"
+        vlog(
+            f"[Boot Guard] At or below MIN_CLAN_SIZE={MIN_CLAN_SIZE} — "
+            f"{len(bootable)} member candidate(s) flagged as watch-only."
+        )
+    elif max_boots < len(bootable):
+        # More bootable members than available slots — worst members get booted,
+        # the remainder are watch-only; demotions are unaffected.
+        worst_first = sorted(bootable, key=lambda c: (c["fame"], c["decks_used"]))
+        boot_tags   = {c["tag"] for c in worst_first[:max_boots]}
+        for c in candidates:
+            c["safe"] = c["role"] == "member" and c["tag"] not in boot_tags
+        vlog(
+            f"[Boot Guard] {max_boots} actionable boot(s), "
+            f"{len(bootable) - max_boots} watch-only (MIN_CLAN_SIZE={MIN_CLAN_SIZE})."
+        )
+    else:
+        for c in candidates:
+            c["safe"] = False
 
     send_discord_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
 
