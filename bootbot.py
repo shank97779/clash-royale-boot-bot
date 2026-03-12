@@ -37,6 +37,14 @@ TOP_PERFORMERS_N      = int(os.getenv("TOP_PERFORMERS_N",      "3"))
 REPORT_BOAT_ATTACKS   = os.getenv("REPORT_BOAT_ATTACKS", "true").strip().lower() == "true"
 MIN_CLAN_SIZE         = int(os.getenv("MIN_CLAN_SIZE",         "40"))  # never boot below this headcount; boot down to it by worst performers
 
+# Comma-separated player tags that are NEVER flagged as boot/demotion candidates
+# (e.g. EXEMPT_MEMBERS=#ABC123,#DEF456).  Tags are case-insensitive.
+EXEMPT_MEMBERS = {
+    tag.strip().upper()
+    for tag in os.getenv("EXEMPT_MEMBERS", "").split(",")
+    if tag.strip()
+}
+
 CR_API_BASE = "https://api.clashroyale.com/v1"
 
 VERBOSE = False  # set to True by --verbose flag
@@ -248,6 +256,11 @@ def find_boot_candidates(
     for m in active_members:
         tag  = m["tag"]
         name = m["name"]
+
+        # Permanently exempt members (owners / OGs) — never flag, ever.
+        if tag.upper() in EXEMPT_MEMBERS:
+            vlog(f"  EXEMPT {name} ({tag}) — permanently exempt, skipping")
+            continue
 
         # Grace: skip members who joined today (first race day, may have used decks elsewhere)
         if tag not in prior_tags:
