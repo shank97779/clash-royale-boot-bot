@@ -225,6 +225,7 @@ def find_boot_candidates(
     conn: sqlite3.Connection,
     today: str,
     period_type: str,
+    section_index: int,
     participants: list,
     active_members: list,
     prior_tags: set,
@@ -273,7 +274,8 @@ def find_boot_candidates(
         decks_total = p.get("decksUsed",      0) if p else 0
         fame        = p.get("fame",           0) if p else 0
 
-        # Count how many warDay snapshots we have for this member (prior to today)
+        # Count how many warDay snapshots we have for this member within the
+        # current race week (same section_index), prior to today.
         row = conn.execute(
             """
             SELECT COUNT(*) AS cnt
@@ -281,8 +283,9 @@ def find_boot_candidates(
             WHERE player_tag = ?
               AND snapshot_date < ?
               AND period_type = 'warDay'
+              AND section_index = ?
             """,
-            (tag, today),
+            (tag, today, section_index),
         ).fetchone()
         prior_war_days = row["cnt"] if row else 0
 
@@ -535,21 +538,29 @@ def send_discord_report(
                         ),
                         "inline": False,
                     })
-                embeds.append({
-                    "title": f":warning: River Race Action Report — {today}",
-                    "description": (
-                        f"**{len(action_candidates)}** of **{member_count}** members in **{clan_name}** "
-                        "are under-participating:\n"
-                        ":crown: **Leader** — flag for review  |  "
-                        ":shield: **Co-Leader** → Demote to Elder  |  "
-                        ":leaves: **Elder** → Demote to Member  |  "
-                        ":bust_in_silhouette: **Member** → Boot"
-                    ),
-                    "color": 0xFF4444,
-                    "fields": fields[:25],
-                    "footer": {"text": "Clash Royale Boot Bot"},
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                })
+                action_description = (
+                    f"**{len(action_candidates)}** of **{member_count}** members in **{clan_name}** "
+                    "are under-participating:\n"
+                    ":crown: **Leader** — flag for review  |  "
+                    ":shield: **Co-Leader** → Demote to Elder  |  "
+                    ":leaves: **Elder** → Demote to Member  |  "
+                    ":bust_in_silhouette: **Member** → Boot"
+                )
+                chunks = [fields[i:i+10] for i in range(0, len(fields), 10)]
+                for i, chunk in enumerate(chunks):
+                    embed = {
+                        "title": (
+                            f":warning: River Race Action Report — {today}"
+                            + (f" ({i+1}/{len(chunks)})" if len(chunks) > 1 else "")
+                        ),
+                        "color": 0xFF4444,
+                        "fields": chunk,
+                        "footer": {"text": "Clash Royale Boot Bot"},
+                    }
+                    if i == 0:
+                        embed["description"] = action_description
+                        embed["timestamp"] = datetime.utcnow().isoformat() + "Z"
+                    embeds.append(embed)
 
             # ── Watch list (yellow) — protected by MIN_CLAN_SIZE ──────────
             if watch_candidates:
@@ -568,18 +579,27 @@ def send_discord_report(
                         ),
                         "inline": False,
                     })
-                embeds.append({
-                    "title": f":eyes: Watch List — {today}",
-                    "description": (
-                        f"**{len(watch_candidates)}** under-performing member(s) are **protected** from action "
-                        f"because the clan is at or near the minimum size of **{MIN_CLAN_SIZE}**. "
-                        "They would be actioned once recruiting improves."
-                    ),
-                    "color": 0xFFCC00,
-                    "fields": watch_fields[:25],
-                    "footer": {"text": "Clash Royale Boot Bot"},
-                })
+                watch_description = (
+                    f"**{len(watch_candidates)}** under-performing member(s) are **protected** from action "
+                    f"because the clan is at or near the minimum size of **{MIN_CLAN_SIZE}**. "
+                    "They would be actioned once recruiting improves."
+                )
+                watch_chunks = [watch_fields[i:i+10] for i in range(0, len(watch_fields), 10)]
+                for i, chunk in enumerate(watch_chunks):
+                    embed = {
+                        "title": (
+                            f":eyes: Watch List — {today}"
+                            + (f" ({i+1}/{len(watch_chunks)})" if len(watch_chunks) > 1 else "")
+                        ),
+                        "color": 0xFFCC00,
+                        "fields": chunk,
+                        "footer": {"text": "Clash Royale Boot Bot"},
+                    }
+                    if i == 0:
+                        embed["description"] = watch_description
+                    embeds.append(embed)
 
+        embeds = embeds[:10]  # Discord hard limit: 10 embeds per message
         payload = {"embeds": embeds}
 
     resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
@@ -669,6 +689,7 @@ def main() -> None:
     global VERBOSE
     parser = argparse.ArgumentParser(description="Clash Royale Boot Bot")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print detailed progress logging")
+    parser.add_argument("--skip-discord", action="store_true", help="Print the report but do not send it to Discord")
     parser.add_argument(
         "--date", "-d",
         metavar="YYYY-MM-DD",
@@ -676,6 +697,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     VERBOSE = args.verbose
+    skip_discord = args.skip_discord
 
     if args.date:
         try:
@@ -697,7 +719,7 @@ def main() -> None:
             prior_tags    = get_prior_tags(conn, today)
             vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
             candidates    = find_boot_candidates(
-                conn, today, snapped["period_type"], snapped["participants"], snapped["members"], prior_tags
+                conn, today, snapped["period_type"], snapped["section_index"], snapped["participants"], snapped["members"], prior_tags
             )
         participants  = snapped["participants"]
         members       = snapped["members"]
@@ -724,7 +746,7 @@ def main() -> None:
             store_snapshot(conn, today, period_type, section_index, period_index, participants)
             store_members_snapshot(conn, today, members)
             candidates = find_boot_candidates(
-                conn, today, period_type, participants, members, prior_tags
+                conn, today, period_type, section_index, participants, members, prior_tags
             )
 
     # ── Shared post-load logic ─────────────────────────────────────────────────
@@ -783,7 +805,11 @@ def main() -> None:
         for c in candidates:
             c["safe"] = False
 
-    send_discord_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
+    if skip_discord:
+        _console_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
+        print("[Discord] Skipped (--skip-discord).")
+    else:
+        send_discord_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
 
 
 if __name__ == "__main__":
