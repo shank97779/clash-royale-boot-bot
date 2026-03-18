@@ -14,6 +14,24 @@ Every run (typically once per day via cron):
 4. On **war days**, evaluates each member who has been in the clan for at least one prior day and flags anyone who is under-participating.
 5. Posts the results to Discord.
 
+### Live run behavior around reset
+
+When running without `--date`, the bot now behaves as follows:
+
+- **Before reset (10:00 UTC by default):** fetches and stores snapshots only; no Discord post.
+- **After reset:** sends **one** Discord report for the **previous Clash day** (`yesterday` in Clash-day terms).
+- Later runs the same day do not repost the same date (deduplicated in SQLite).
+
+### Clash day timestamping
+
+The bot stores snapshots under a computed Clash "day" (`YYYY-MM-DD`) using UTC reset time,
+not server local time. By default, day rollover is `10:00 UTC`.
+
+If your run schedule is close to the reset boundary, you can tune this with:
+
+- `CLASH_RESET_UTC_HOUR` (default `10`)
+- `CLASH_RESET_UTC_MINUTE` (default `0`)
+
 ### Top performers shoutout (war days only)
 
 After boot evaluation, the top `TOP_PERFORMERS_N` distinct fame tiers are identified. Every player tied at a given tier earns the same medal. Within a tier, players are sorted by fewest decks used (most efficient first). The shoutout is posted as a gold embed in Discord — good for morale!
@@ -73,6 +91,8 @@ Edit `.env`:
 | `CLAN_TAG` | Clan tag including `#` | `#PJ8Q8P` |
 | `DISCORD_WEBHOOK` | Incoming webhook URL from your Discord server | *(optional)* |
 | `DB_PATH` | Path to the SQLite database file | `bootbot.db` |
+| `CLASH_RESET_UTC_HOUR` | UTC hour used for Clash day rollover | `10` |
+| `CLASH_RESET_UTC_MINUTE` | UTC minute used for Clash day rollover | `0` |
 | `MIN_DECKS_PER_DAY` | Expected deck uses per war day | `4` |
 | `MIN_PARTICIPATION_PCT` | Flag if cumulative usage is below this fraction of expected | `0.5` |
 | `MIN_CLAN_SIZE` | Never boot members below this headcount; demotions are unaffected | `40` |
@@ -95,11 +115,17 @@ venv/bin/python bootbot.py --verbose
 crontab -e
 ```
 
-Add (runs at 4:55 AM daily):
+Recommended hourly schedule:
 
 ```
-55 4 * * * cd /PATH/TO/clash-royale-boot-bot/ && venv/bin/python bootbot.py >> tracker.log 2>&1
+0 * * * * cd /home/matt/public_html/BornGifted && /home/matt/public_html/BornGifted/venv/bin/python /home/matt/public_html/BornGifted/bootbot.py >> /home/matt/public_html/BornGifted/tracker.log 2>&1
 ```
+
+This is safe to run hourly because the bot is reset-aware:
+
+- Before `10:00 UTC`, it fetches and stores snapshots only.
+- After `10:00 UTC`, the first run sends the report for the previous Clash day.
+- Later runs the same day do not repost the same report.
 
 ---
 

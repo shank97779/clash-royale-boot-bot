@@ -10,17 +10,16 @@ import argparse
 import os
 import sys
 import sqlite3
-import time
 import requests
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Fix timezone so midnight == 10:00am UTC == Clash game day reset.
-# Etc/GMT+10 is POSIX notation for UTC-10 (signs are inverted in POSIX).
-os.environ["TZ"] = "Etc/GMT+10"
-time.tzset()
+# Clash "day" rolls over at the river race reset time in UTC.
+# Defaults preserve existing behavior: 10:00 UTC reset.
+CLASH_RESET_UTC_HOUR   = int(os.getenv("CLASH_RESET_UTC_HOUR", "10"))
+CLASH_RESET_UTC_MINUTE = int(os.getenv("CLASH_RESET_UTC_MINUTE", "0"))
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 CLAN_TAG        = os.getenv("CLAN_TAG",         "#PJ8Q8P")   # BornGifted tag
@@ -54,6 +53,20 @@ def vlog(*args, **kwargs) -> None:
     """Print only when --verbose is active."""
     if VERBOSE:
         print("  [v]", *args, **kwargs)
+
+
+def clash_day_from_utc(now_utc: datetime | None = None) -> str:
+    """
+    Returns the Clash race day label (YYYY-MM-DD), based on UTC reset time.
+
+    If reset is 10:00 UTC, then:
+      - 2026-03-15 09:59 UTC -> clash day 2026-03-14
+      - 2026-03-15 10:00 UTC -> clash day 2026-03-15
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    shifted = now_utc - timedelta(hours=CLASH_RESET_UTC_HOUR, minutes=CLASH_RESET_UTC_MINUTE)
+    return shifted.date().isoformat()
 
 # ── Database ───────────────────────────────────────────────────────────────────
 
@@ -100,8 +113,54 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_mem_date ON member_snapshots(snapshot_date);
         CREATE INDEX IF NOT EXISTS idx_mem_tag  ON member_snapshots(player_tag);
+
+        CREATE TABLE IF NOT EXISTS report_history (
+            report_date TEXT PRIMARY KEY,
+            sent_at_utc TEXT NOT NULL
+        );
     """)
     conn.commit()
+
+
+def reset_datetime_utc(now_utc: datetime) -> datetime:
+    """Returns today's reset timestamp in UTC."""
+    return now_utc.replace(
+        hour=CLASH_RESET_UTC_HOUR,
+        minute=CLASH_RESET_UTC_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+
+def snapshot_exists(conn: sqlite3.Connection, snapshot_date: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM snapshots WHERE snapshot_date = ? LIMIT 1",
+        (snapshot_date,),
+    ).fetchone()
+    return row is not None
+
+
+def report_was_sent(conn: sqlite3.Connection, report_date: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM report_history WHERE report_date = ? LIMIT 1",
+        (report_date,),
+    ).fetchone()
+    return row is not None
+
+
+def mark_report_sent(conn: sqlite3.Connection, report_date: str, now_utc: datetime) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO report_history (report_date, sent_at_utc)
+        VALUES (?, ?)
+        """,
+        (report_date, now_utc.isoformat()),
+    )
+    conn.commit()
+
+
+def previous_clash_day(clash_day: str) -> str:
+    return (date.fromisoformat(clash_day) - timedelta(days=1)).isoformat()
 
 # ── API ────────────────────────────────────────────────────────────────────────
 
@@ -181,6 +240,11 @@ def store_snapshot(
 
 def store_members_snapshot(conn: sqlite3.Connection, today: str, members: list) -> None:
     vlog(f"Storing member snapshot for {len(members)} member(s) [{today}] …")
+
+    # Replace the day's roster so churn doesn't accumulate stale ex-members.
+    # Without this, repeated runs can exceed 50 tracked members for one day.
+    conn.execute("DELETE FROM member_snapshots WHERE snapshot_date = ?", (today,))
+
     for m in members:
         conn.execute(
             """
@@ -188,13 +252,6 @@ def store_members_snapshot(conn: sqlite3.Connection, today: str, members: list) 
                 (snapshot_date, player_tag, player_name, role,
                  exp_level, trophies, donations, last_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(snapshot_date, player_tag) DO UPDATE SET
-                player_name = excluded.player_name,
-                role        = excluded.role,
-                exp_level   = excluded.exp_level,
-                trophies    = excluded.trophies,
-                donations   = excluded.donations,
-                last_seen   = excluded.last_seen
             """,
             (
                 today,
@@ -439,12 +496,12 @@ def send_discord_report(
     today: str,
     period_type: str,
     member_count: int = 0,
-) -> None:
+) -> bool:
     _console_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
 
     if not DISCORD_WEBHOOK:
         print("[Discord] DISCORD_WEBHOOK not set — skipping Discord notification.")
-        return
+        return False
 
     if period_type != "warDay":
         # Optionally send a quiet note on training days
@@ -605,6 +662,7 @@ def send_discord_report(
     resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
     if resp.status_code not in (200, 204):
         print(f"[Discord] Warning: HTTP {resp.status_code} — {resp.text}")
+        return False
     else:
         n_action = sum(1 for c in candidates if not c.get("safe"))
         n_watch  = sum(1 for c in candidates if c.get("safe"))
@@ -613,6 +671,7 @@ def send_discord_report(
             f"{sum(len(pl) for _, pl in top.get('tiers', []))} shoutout(s), "
             f"{len(boat_offenders)} boat offender(s), out of {member_count} members)."
         )
+        return True
 
 # ── Replay from DB ────────────────────────────────────────────────────────────
 
@@ -632,8 +691,8 @@ def load_snapshot_from_db(conn: sqlite3.Connection, target_date: str) -> dict:
     ).fetchall()
 
     if not rows:
-        sys.exit(
-            f"Error: No race snapshot found for {target_date}. "
+        raise LookupError(
+            f"No race snapshot found for {target_date}. "
             "Only dates that have already been fetched can be replayed."
         )
 
@@ -660,7 +719,7 @@ def load_snapshot_from_db(conn: sqlite3.Connection, target_date: str) -> dict:
     ).fetchall()
 
     if not mem_rows:
-        sys.exit(f"Error: No member snapshot found for {target_date}.")
+        raise LookupError(f"No member snapshot found for {target_date}.")
 
     members = [
         {
@@ -681,6 +740,63 @@ def load_snapshot_from_db(conn: sqlite3.Connection, target_date: str) -> dict:
         "period_index":  rows[0]["period_index"],
         "participants":  participants,
         "members":       members,
+    }
+
+
+def build_report_from_snapshot(
+    conn: sqlite3.Connection,
+    report_date: str,
+    snapped: dict,
+) -> dict:
+    """Builds candidates/top/offender report data from a stored snapshot."""
+    participants = snapped["participants"]
+    members = snapped["members"]
+    period_type = snapped["period_type"]
+    section_index = snapped["section_index"]
+
+    prior_tags = get_prior_tags(conn, report_date)
+    candidates = find_boot_candidates(
+        conn,
+        report_date,
+        period_type,
+        section_index,
+        participants,
+        members,
+        prior_tags,
+    )
+
+    active_tags = {m["tag"] for m in members}
+    member_count = len(members)
+    top = find_top_performers(participants, active_tags) if period_type == "warDay" else {}
+    boat_offenders = find_boat_offenders(participants, active_tags) if (period_type == "warDay" and REPORT_BOAT_ATTACKS) else []
+
+    # Demotions (co-leader, elder) don't reduce headcount — always actioned.
+    # Only outright boots (member role) are guarded by MIN_CLAN_SIZE.
+    bootable = [c for c in candidates if c["role"] == "member"]
+    max_boots = max(0, member_count - MIN_CLAN_SIZE)
+    if max_boots == 0:
+        for c in candidates:
+            c["safe"] = c["role"] == "member"
+    elif max_boots < len(bootable):
+        worst_first = sorted(bootable, key=lambda c: (c["fame"], c["decks_used"]))
+        boot_tags = {c["tag"] for c in worst_first[:max_boots]}
+        for c in candidates:
+            c["safe"] = c["role"] == "member" and c["tag"] not in boot_tags
+    else:
+        for c in candidates:
+            c["safe"] = False
+
+    return {
+        "report_date": report_date,
+        "participants": participants,
+        "members": members,
+        "period_type": period_type,
+        "section_index": section_index,
+        "period_index": snapped["period_index"],
+        "member_count": member_count,
+        "candidates": candidates,
+        "top": top,
+        "boat_offenders": boat_offenders,
     }
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -704,112 +820,135 @@ def main() -> None:
             date.fromisoformat(args.date)
         except ValueError:
             sys.exit(f"Error: --date must be YYYY-MM-DD, got '{args.date}'.")
-        today = args.date
-    else:
-        today = date.today().isoformat()
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # ── Load data — either live from API or replayed from DB ───────────────────
+    # ── Replay path (--date) ───────────────────────────────────────────────────
     if args.date:
+        today = args.date
         print(f"[{now}] Replaying saved snapshot for {today} (no API calls) …")
         with get_db() as conn:
             init_db(conn)
-            snapped       = load_snapshot_from_db(conn, today)
-            prior_tags    = get_prior_tags(conn, today)
-            vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
-            candidates    = find_boot_candidates(
-                conn, today, snapped["period_type"], snapped["section_index"], snapped["participants"], snapped["members"], prior_tags
-            )
-        participants  = snapped["participants"]
-        members       = snapped["members"]
-        clan_name     = CLAN_TAG
-        period_type   = snapped["period_type"]
-        section_index = snapped["section_index"]
-        period_index  = snapped["period_index"]
-    else:
-        if not API_TOKEN:
-            sys.exit("Error: CR_API_TOKEN is not set. Copy .env.example to .env and fill it in.")
-        print(f"[{now}] Fetching river race data for {CLAN_TAG} …")
-        data    = fetch_river_race()
-        members = fetch_members()
-        clan_info     = data.get("clan", {})
-        clan_name     = clan_info.get("name", CLAN_TAG)
-        participants  = clan_info.get("participants", [])
-        period_type   = data.get("periodType", "unknown")
-        section_index = data.get("sectionIndex", 0)
-        period_index  = data.get("periodIndex", 0)
-        with get_db() as conn:
-            init_db(conn)
-            prior_tags = get_prior_tags(conn, today)
-            vlog(f"Prior tag count (seen before {today}): {len(prior_tags)}")
-            store_snapshot(conn, today, period_type, section_index, period_index, participants)
-            store_members_snapshot(conn, today, members)
-            candidates = find_boot_candidates(
-                conn, today, period_type, section_index, participants, members, prior_tags
-            )
+            try:
+                snapped = load_snapshot_from_db(conn, today)
+            except LookupError as ex:
+                sys.exit(f"Error: {ex}")
+            report = build_report_from_snapshot(conn, today, snapped)
 
-    # ── Shared post-load logic ─────────────────────────────────────────────────
-    active_tags  = {m["tag"] for m in members}
-    member_count = len(members)
+        if skip_discord:
+            _console_report(
+                report["candidates"],
+                report["top"],
+                report["boat_offenders"],
+                CLAN_TAG,
+                report["report_date"],
+                report["period_type"],
+                report["member_count"],
+            )
+            print("[Discord] Skipped (--skip-discord).")
+        else:
+            send_discord_report(
+                report["candidates"],
+                report["top"],
+                report["boat_offenders"],
+                CLAN_TAG,
+                report["report_date"],
+                report["period_type"],
+                report["member_count"],
+            )
+        return
+
+    # ── Live path ───────────────────────────────────────────────────────────────
+    today = clash_day_from_utc(now_utc)
+    reset_at = reset_datetime_utc(now_utc)
+    before_reset = now_utc < reset_at
+
+    if not API_TOKEN:
+        sys.exit("Error: CR_API_TOKEN is not set. Copy .env.example to .env and fill it in.")
 
     print(
-        f"  Clan: {clan_name}  |  Active members: {member_count}"
+        f"[{now}] Fetching river race data for {CLAN_TAG} … "
+        f"(clash day: {today}, reset: {CLASH_RESET_UTC_HOUR:02d}:{CLASH_RESET_UTC_MINUTE:02d} UTC)"
+    )
+    data = fetch_river_race()
+    members = fetch_members()
+    clan_info = data.get("clan", {})
+    clan_name = clan_info.get("name", CLAN_TAG)
+    participants = clan_info.get("participants", [])
+    period_type = data.get("periodType", "unknown")
+    section_index = data.get("sectionIndex", 0)
+    period_index = data.get("periodIndex", 0)
+
+    print(
+        f"  Clan: {clan_name}  |  Active members: {len(members)}"
         f"  |  Race participants: {len(participants)}"
         f"  |  Period: {period_type}  (section={section_index}, period={period_index})"
     )
 
-    # Verbose: dump full member roster
     if VERBOSE:
         role_order = {"leader": 0, "coLeader": 1, "elder": 2, "member": 3}
         for m in sorted(members, key=lambda x: (role_order.get(x.get("role", "member"), 9), x["name"])):
             p = next((x for x in participants if x["tag"] == m["tag"]), None)
             decks_today = p.get("decksUsedToday", 0) if p else 0
-            decks_total = p.get("decksUsed",      0) if p else 0
-            fame        = p.get("fame",           0) if p else 0
-            in_race     = "in race" if p else "NOT IN RACE"
+            decks_total = p.get("decksUsed", 0) if p else 0
+            fame = p.get("fame", 0) if p else 0
+            in_race = "in race" if p else "NOT IN RACE"
             print(
                 f"  [v]   {m['name']:<20} ({m['tag']:<12}) [{m.get('role','?'):<9}]"
                 f"  fame={fame:<6}  decks={decks_total} today={decks_today}  {in_race}"
             )
 
-    top            = find_top_performers(participants, active_tags) if period_type == "warDay" else {}
-    boat_offenders = find_boat_offenders(participants, active_tags) if (period_type == "warDay" and REPORT_BOAT_ATTACKS) else []
-    vlog(f"Top performers: {[(fame_val, [p['name'] for p in players]) for fame_val, players in top.get('tiers', [])]}")
-    vlog(f"Boat offenders: {[p['name'] for p in boat_offenders]}")
+    report_to_send = None
+    report_date = previous_clash_day(today)
 
-    # Demotions (co-leader, elder) don't reduce headcount — always actioned.
-    # Only outright boots (member role) are guarded by MIN_CLAN_SIZE.
-    bootable = [c for c in candidates if c["role"] == "member"]
-    max_boots = max(0, member_count - MIN_CLAN_SIZE)
-    if max_boots == 0:
-        # At or below threshold — all members are watch-only; demotions still proceed.
-        for c in candidates:
-            c["safe"] = c["role"] == "member"
-        vlog(
-            f"[Boot Guard] At or below MIN_CLAN_SIZE={MIN_CLAN_SIZE} — "
-            f"{len(bootable)} member candidate(s) flagged as watch-only."
-        )
-    elif max_boots < len(bootable):
-        # More bootable members than available slots — worst members get booted,
-        # the remainder are watch-only; demotions are unaffected.
-        worst_first = sorted(bootable, key=lambda c: (c["fame"], c["decks_used"]))
-        boot_tags   = {c["tag"] for c in worst_first[:max_boots]}
-        for c in candidates:
-            c["safe"] = c["role"] == "member" and c["tag"] not in boot_tags
-        vlog(
-            f"[Boot Guard] {max_boots} actionable boot(s), "
-            f"{len(bootable) - max_boots} watch-only (MIN_CLAN_SIZE={MIN_CLAN_SIZE})."
-        )
-    else:
-        for c in candidates:
-            c["safe"] = False
+    with get_db() as conn:
+        init_db(conn)
+        store_snapshot(conn, today, period_type, section_index, period_index, participants)
+        store_members_snapshot(conn, today, members)
+
+        if before_reset:
+            print("[Discord] Before UTC reset — data updated, no Discord report sent.")
+            return
+
+        if report_was_sent(conn, report_date):
+            print(f"[Discord] Report for {report_date} already sent — skipping duplicate.")
+            return
+
+        try:
+            snapped_report = load_snapshot_from_db(conn, report_date)
+        except LookupError as ex:
+            print(f"[Discord] Cannot build report for {report_date}: {ex}")
+            return
+
+        report_to_send = build_report_from_snapshot(conn, report_date, snapped_report)
 
     if skip_discord:
-        _console_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
+        _console_report(
+            report_to_send["candidates"],
+            report_to_send["top"],
+            report_to_send["boat_offenders"],
+            clan_name,
+            report_to_send["report_date"],
+            report_to_send["period_type"],
+            report_to_send["member_count"],
+        )
         print("[Discord] Skipped (--skip-discord).")
-    else:
-        send_discord_report(candidates, top, boat_offenders, clan_name, today, period_type, member_count)
+        return
+
+    sent = send_discord_report(
+        report_to_send["candidates"],
+        report_to_send["top"],
+        report_to_send["boat_offenders"],
+        clan_name,
+        report_to_send["report_date"],
+        report_to_send["period_type"],
+        report_to_send["member_count"],
+    )
+    if sent:
+        with get_db() as conn:
+            init_db(conn)
+            mark_report_sent(conn, report_date, now_utc)
 
 
 if __name__ == "__main__":
