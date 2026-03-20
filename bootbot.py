@@ -216,11 +216,13 @@ def store_snapshot(
                 section_index    = excluded.section_index,
                 period_index     = excluded.period_index,
                 player_name      = excluded.player_name,
-                fame             = excluded.fame,
-                repair_points    = excluded.repair_points,
-                boat_attacks     = excluded.boat_attacks,
-                decks_used       = excluded.decks_used,
-                decks_used_today = excluded.decks_used_today
+                -- Keep the highest values seen during hourly runs for the same
+                -- clash day so transient API regressions don't overwrite progress.
+                fame             = MAX(snapshots.fame, excluded.fame),
+                repair_points    = MAX(snapshots.repair_points, excluded.repair_points),
+                boat_attacks     = MAX(snapshots.boat_attacks, excluded.boat_attacks),
+                decks_used       = MAX(snapshots.decks_used, excluded.decks_used),
+                decks_used_today = MAX(snapshots.decks_used_today, excluded.decks_used_today)
             """,
             (
                 today,
@@ -293,15 +295,13 @@ def find_boot_candidates(
     Only current clan members (from the /members endpoint) are evaluated —
     players who left the clan since the race started are ignored.
 
-    Rules (only evaluated on war days):
+        Rules (only evaluated on war days):
       - NEW MEMBER GRACE: members whose tag wasn't seen before today are skipped.
         They may have had limited decks available on their first race day.
-      - NO PARTICIPATION: active members not in the participants list at all get
-        flagged immediately (0 decks, 0 fame).
-      - ZERO DECKS TODAY: flagged if decksUsedToday == 0.
-      - LOW CUMULATIVE: flagged if decksUsed < (prior_war_days * MIN_DECKS_PER_DAY
-        * MIN_PARTICIPATION_PCT). Prior war days = number of warDay snapshots
-        recorded for that player before today.
+            - NO PARTICIPATION: active members not in the participants list at all get
+                flagged immediately (0 decks, 0 fame).
+            - ZERO DECKS TODAY: flagged if decksUsedToday == 0.
+
     """
     if period_type != "warDay":
         vlog("Period is not warDay — skipping boot evaluation.")
@@ -327,9 +327,9 @@ def find_boot_candidates(
 
         p = participant_by_tag.get(tag)  # None if they never entered the race
 
+        decks_total = p.get("decksUsed", 0) if p else 0
+        fame        = p.get("fame", 0) if p else 0
         decks_today = p.get("decksUsedToday", 0) if p else 0
-        decks_total = p.get("decksUsed",      0) if p else 0
-        fame        = p.get("fame",           0) if p else 0
 
         # Count how many warDay snapshots we have for this member within the
         # current race week (same section_index), prior to today.
@@ -503,9 +503,11 @@ def send_discord_report(
         print("[Discord] DISCORD_WEBHOOK not set — skipping Discord notification.")
         return False
 
+    payload_batches = []
+
     if period_type != "warDay":
         # Optionally send a quiet note on training days
-        payload = {
+        payload_batches = [{
             "embeds": [
                 {
                     "title": f"River Race Snapshot — {today}",
@@ -518,7 +520,7 @@ def send_discord_report(
                     "footer": {"text": "Clash Royale Boot Bot"},
                 }
             ]
-        }
+        }]
     else:
         embeds = []
 
@@ -537,13 +539,20 @@ def send_discord_report(
                         ),
                         "inline": False,
                     })
-            embeds.append({
-                "title": f":trophy: Top Performers — {today}",
-                "description": f"Shoutout to the standout players in **{clan_name}** this race week!",
-                "color": 0xFFD700,
-                "fields": shoutout_fields,
-                "footer": {"text": "Clash Royale Boot Bot"},
-            })
+            shoutout_chunks = [shoutout_fields[i:i+10] for i in range(0, len(shoutout_fields), 10)]
+            for i, chunk in enumerate(shoutout_chunks):
+                embed = {
+                    "title": (
+                        f":trophy: Top Performers — {today}"
+                        + (f" ({i+1}/{len(shoutout_chunks)})" if len(shoutout_chunks) > 1 else "")
+                    ),
+                    "color": 0xFFD700,
+                    "fields": chunk,
+                    "footer": {"text": "Clash Royale Boot Bot"},
+                }
+                if i == 0:
+                    embed["description"] = f"Shoutout to the standout players in **{clan_name}** this race week!"
+                embeds.append(embed)
 
         # ── Boat attack nudge embed (orange) ────────────────────────────────
         if boat_offenders:
@@ -656,22 +665,23 @@ def send_discord_report(
                         embed["description"] = watch_description
                     embeds.append(embed)
 
-        embeds = embeds[:10]  # Discord hard limit: 10 embeds per message
-        payload = {"embeds": embeds}
+        payload_batches = [{"embeds": embeds[i:i+10]} for i in range(0, len(embeds), 10)]
 
-    resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-    if resp.status_code not in (200, 204):
-        print(f"[Discord] Warning: HTTP {resp.status_code} — {resp.text}")
-        return False
-    else:
-        n_action = sum(1 for c in candidates if not c.get("safe"))
-        n_watch  = sum(1 for c in candidates if c.get("safe"))
-        print(
-            f"[Discord] Report sent ({n_action} actionable, {n_watch} watch-only, "
-            f"{sum(len(pl) for _, pl in top.get('tiers', []))} shoutout(s), "
-            f"{len(boat_offenders)} boat offender(s), out of {member_count} members)."
-        )
-        return True
+    for batch_idx, payload in enumerate(payload_batches, start=1):
+        resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        if resp.status_code not in (200, 204):
+            print(f"[Discord] Warning: HTTP {resp.status_code} on batch {batch_idx}/{len(payload_batches)} — {resp.text}")
+            return False
+
+    n_action = sum(1 for c in candidates if not c.get("safe"))
+    n_watch  = sum(1 for c in candidates if c.get("safe"))
+    print(
+        f"[Discord] Report sent ({n_action} actionable, {n_watch} watch-only, "
+        f"{sum(len(pl) for _, pl in top.get('tiers', []))} shoutout(s), "
+        f"{len(boat_offenders)} boat offender(s), out of {member_count} members, "
+        f"across {len(payload_batches)} message(s))."
+    )
+    return True
 
 # ── Replay from DB ────────────────────────────────────────────────────────────
 
