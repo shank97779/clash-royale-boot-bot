@@ -162,6 +162,44 @@ def mark_report_sent(conn: sqlite3.Connection, report_date: str, now_utc: dateti
 def previous_clash_day(clash_day: str) -> str:
     return (date.fromisoformat(clash_day) - timedelta(days=1)).isoformat()
 
+
+def prior_war_progress(
+    conn: sqlite3.Connection,
+    player_tag: str,
+    today: str,
+    section_index: int,
+) -> tuple[int, int]:
+    """Returns (prior_war_days, prior_cumulative_decks) for this race week."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS war_days, MAX(decks_used) AS cumulative_decks
+        FROM snapshots
+        WHERE player_tag = ?
+          AND snapshot_date < ?
+          AND period_type = 'warDay'
+          AND section_index = ?
+        """,
+        (player_tag, today, section_index),
+    ).fetchone()
+    if not row:
+        return 0, 0
+    return row["war_days"] or 0, row["cumulative_decks"] or 0
+
+
+def derive_decks_used_today(
+    conn: sqlite3.Connection,
+    today: str,
+    period_type: str,
+    section_index: int,
+    player_tag: str,
+    decks_used: int,
+) -> int:
+    """Computes today's deck usage from cumulative race progress."""
+    if period_type != "warDay":
+        return 0
+    _, prior_decks_total = prior_war_progress(conn, player_tag, today, section_index)
+    return max(0, decks_used - prior_decks_total)
+
 # ── API ────────────────────────────────────────────────────────────────────────
 
 def fetch_river_race() -> dict:
@@ -204,6 +242,15 @@ def store_snapshot(
 ) -> None:
     vlog(f"Storing race snapshot for {len(participants)} participant(s) [{today}] …")
     for p in participants:
+        decks_used = p.get("decksUsed", 0)
+        decks_used_today = derive_decks_used_today(
+            conn,
+            today,
+            period_type,
+            section_index,
+            p["tag"],
+            decks_used,
+        )
         conn.execute(
             """
             INSERT INTO snapshots
@@ -234,8 +281,8 @@ def store_snapshot(
                 p.get("fame", 0),
                 p.get("repairPoints", 0),
                 p.get("boatAttacks", 0),
-                p.get("decksUsed", 0),
-                p.get("decksUsedToday", 0),
+                decks_used,
+                decks_used_today,
             ),
         )
     conn.commit()
@@ -329,22 +376,8 @@ def find_boot_candidates(
 
         decks_total = p.get("decksUsed", 0) if p else 0
         fame        = p.get("fame", 0) if p else 0
-        decks_today = p.get("decksUsedToday", 0) if p else 0
-
-        # Count how many warDay snapshots we have for this member within the
-        # current race week (same section_index), prior to today.
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM snapshots
-            WHERE player_tag = ?
-              AND snapshot_date < ?
-              AND period_type = 'warDay'
-              AND section_index = ?
-            """,
-            (tag, today, section_index),
-        ).fetchone()
-        prior_war_days = row["cnt"] if row else 0
+        prior_war_days, prior_decks = prior_war_progress(conn, tag, today, section_index)
+        decks_today = max(0, decks_total - prior_decks) if p else 0
 
         reasons = []
 
@@ -896,19 +929,6 @@ def main() -> None:
         f"  |  Period: {period_type}  (section={section_index}, period={period_index})"
     )
 
-    if VERBOSE:
-        role_order = {"leader": 0, "coLeader": 1, "elder": 2, "member": 3}
-        for m in sorted(members, key=lambda x: (role_order.get(x.get("role", "member"), 9), x["name"])):
-            p = next((x for x in participants if x["tag"] == m["tag"]), None)
-            decks_today = p.get("decksUsedToday", 0) if p else 0
-            decks_total = p.get("decksUsed", 0) if p else 0
-            fame = p.get("fame", 0) if p else 0
-            in_race = "in race" if p else "NOT IN RACE"
-            print(
-                f"  [v]   {m['name']:<20} ({m['tag']:<12}) [{m.get('role','?'):<9}]"
-                f"  fame={fame:<6}  decks={decks_total} today={decks_today}  {in_race}"
-            )
-
     report_to_send = None
     report_date = previous_clash_day(today)
 
@@ -916,6 +936,22 @@ def main() -> None:
         init_db(conn)
         store_snapshot(conn, today, period_type, section_index, period_index, participants)
         store_members_snapshot(conn, today, members)
+
+        if VERBOSE:
+            participant_by_tag = {p["tag"]: p for p in participants}
+            role_order = {"leader": 0, "coLeader": 1, "elder": 2, "member": 3}
+            for m in sorted(members, key=lambda x: (role_order.get(x.get("role", "member"), 9), x["name"])):
+                p = participant_by_tag.get(m["tag"])
+                decks_total = p.get("decksUsed", 0) if p else 0
+                fame = p.get("fame", 0) if p else 0
+                in_race = "in race" if p else "NOT IN RACE"
+                decks_today = derive_decks_used_today(
+                    conn, today, period_type, section_index, m["tag"], decks_total
+                )
+                print(
+                    f"  [v]   {m['name']:<20} ({m['tag']:<12}) [{m.get('role','?'):<9}]"
+                    f"  fame={fame:<6}  decks={decks_total} today={decks_today}  {in_race}"
+                )
 
         if before_reset:
             print("[Discord] Before UTC reset — data updated, no Discord report sent.")

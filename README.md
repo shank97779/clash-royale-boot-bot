@@ -10,7 +10,7 @@ Every run (typically once per day via cron):
 
 1. Hits the **`/currentriverrace`** endpoint to get fame, repair points, boat attacks, and deck usage per participant.
 2. Hits the **`/members`** endpoint to get the live roster — only current members are evaluated; ex-members still in the race data are silently ignored.
-3. Stores both snapshots in `bootbot.db`.
+3. Stores both snapshots in `bootbot.db`, including a locally derived daily deck count based on cumulative race progress.
 4. On **war days**, evaluates each member who has been in the clan for at least one prior day and flags anyone who is under-participating.
 5. Posts the results to Discord.
 
@@ -51,7 +51,10 @@ Boat attacks earn only **125 fame per tower** hit, compared to **200 fame** for 
 
 A member is flagged if **either** condition is true:
 
-- `decksUsedToday == 0` — didn't play at all today.
+- Derived daily decks used is `0` — didn't play at all today. The bot stores and computes
+	this from the change in cumulative `decksUsed` between consecutive war-day
+	snapshots in the same race week, because the API's `decksUsedToday` field is
+	not always reliable in saved snapshots.
 - Cumulative `decksUsed < MIN_PARTICIPATION_PCT × (prior_war_days × MIN_DECKS_PER_DAY)` — overall participation is too low (default: below 50 % of expected decks).
 
 **New-member grace:** any player whose tag wasn't seen in a previous snapshot is skipped entirely — they may not have had all 4 decks available on their first race day.
