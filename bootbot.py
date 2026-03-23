@@ -163,6 +163,22 @@ def previous_clash_day(clash_day: str) -> str:
     return (date.fromisoformat(clash_day) - timedelta(days=1)).isoformat()
 
 
+def pick_report_date(today: str, period_type: str, before_reset: bool) -> str | None:
+    """
+    Chooses which snapshot date should be reported in live mode.
+
+    Rules:
+    - After reset: report the previous clash day (fully completed).
+    - Before reset on war day: suppress report to avoid premature boot decisions.
+    - Before reset on non-war day: report today's clash-day snapshot.
+    """
+    if before_reset:
+        if period_type == "warDay":
+            return None
+        return today
+    return previous_clash_day(today)
+
+
 def prior_war_progress(
     conn: sqlite3.Connection,
     player_tag: str,
@@ -199,6 +215,15 @@ def derive_decks_used_today(
         return 0
     _, prior_decks_total = prior_war_progress(conn, player_tag, today, section_index)
     return max(0, decks_used - prior_decks_total)
+
+
+def period_types_for_day(conn: sqlite3.Connection, snapshot_date: str) -> set[str]:
+    """Returns distinct period types already stored for a clash day."""
+    rows = conn.execute(
+        "SELECT DISTINCT period_type FROM snapshots WHERE snapshot_date = ?",
+        (snapshot_date,),
+    ).fetchall()
+    return {r["period_type"] for r in rows if r["period_type"]}
 
 # ── API ────────────────────────────────────────────────────────────────────────
 
@@ -241,6 +266,16 @@ def store_snapshot(
     participants: list,
 ) -> None:
     vlog(f"Storing race snapshot for {len(participants)} participant(s) [{today}] …")
+
+    existing_period_types = period_types_for_day(conn, today)
+    if existing_period_types and period_type not in existing_period_types:
+        existing_display = ",".join(sorted(existing_period_types))
+        print(
+            f"[Data Warning] Period type changed for clash day {today}: "
+            f"existing={existing_display}, incoming={period_type}. "
+            "Preserving warDay when present."
+        )
+
     for p in participants:
         decks_used = p.get("decksUsed", 0)
         decks_used_today = derive_decks_used_today(
@@ -259,7 +294,13 @@ def store_snapshot(
                  fame, repair_points, boat_attacks, decks_used, decks_used_today)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(snapshot_date, player_tag) DO UPDATE SET
-                period_type      = excluded.period_type,
+                -- Preserve war-day classification once observed for a clash day.
+                -- The API can flip to training near boundaries; don't downgrade.
+                period_type      = CASE
+                    WHEN snapshots.period_type = 'warDay' OR excluded.period_type = 'warDay'
+                        THEN 'warDay'
+                    ELSE excluded.period_type
+                END,
                 section_index    = excluded.section_index,
                 period_index     = excluded.period_index,
                 player_name      = excluded.player_name,
@@ -545,7 +586,7 @@ def send_discord_report(
                 {
                     "title": f"River Race Snapshot — {today}",
                     "description": (
-                        f"Today is a **{period_type}** day for **{clan_name}** "
+                        f"Snapshot date **{today}** is a **{period_type}** day for **{clan_name}** "
                         f"({member_count} active members). "
                         "No boot evaluation on non-war days."
                     ),
@@ -930,7 +971,7 @@ def main() -> None:
     )
 
     report_to_send = None
-    report_date = previous_clash_day(today)
+    report_date = pick_report_date(today, period_type, before_reset)
 
     with get_db() as conn:
         init_db(conn)
@@ -953,8 +994,8 @@ def main() -> None:
                     f"  fame={fame:<6}  decks={decks_total} today={decks_today}  {in_race}"
                 )
 
-        if before_reset:
-            print("[Discord] Before UTC reset — data updated, no Discord report sent.")
+        if report_date is None:
+            print("[Discord] Before UTC reset on war day — data updated, no Discord report sent.")
             return
 
         if report_was_sent(conn, report_date):

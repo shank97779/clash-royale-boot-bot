@@ -6,6 +6,8 @@ Run with:  python -m unittest test_bootbot -v
 
 import sqlite3
 import unittest
+import io
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -131,6 +133,34 @@ class TestPreviousClashDay(unittest.TestCase):
 
     def test_leap_year(self):
         self.assertEqual(bootbot.previous_clash_day("2024-03-01"), "2024-02-29")
+
+
+# ── pick_report_date ─────────────────────────────────────────────────────────
+
+class TestPickReportDate(unittest.TestCase):
+
+    def test_after_reset_reports_previous_clash_day(self):
+        self.assertEqual(
+            bootbot.pick_report_date("2026-03-23", "warDay", before_reset=False),
+            "2026-03-22",
+        )
+
+    def test_before_reset_war_day_suppresses_report(self):
+        self.assertIsNone(
+            bootbot.pick_report_date("2026-03-22", "warDay", before_reset=True)
+        )
+
+    def test_before_reset_training_day_reports_current_clash_day(self):
+        self.assertEqual(
+            bootbot.pick_report_date("2026-03-22", "trainingDay", before_reset=True),
+            "2026-03-22",
+        )
+
+    def test_before_reset_unknown_period_treated_as_non_war(self):
+        self.assertEqual(
+            bootbot.pick_report_date("2026-03-22", "unknown", before_reset=True),
+            "2026-03-22",
+        )
 
 
 # ── reset_datetime_utc ────────────────────────────────────────────────────────
@@ -381,6 +411,24 @@ class TestStoreSnapshot(unittest.TestCase):
         row = self._row("2026-03-20", "#AAA")
         self.assertEqual(row["decks_used"], 8)
         self.assertEqual(row["fame"], 1600)
+
+    def test_period_type_does_not_downgrade_from_war_day(self):
+        p = participant("#AAA", "Alice", decks_used=4, fame=800)
+        bootbot.store_snapshot(self.conn, "2026-03-22", "warDay", 0, 0, [p])
+        # Later run for same clash day may report training near boundary.
+        bootbot.store_snapshot(self.conn, "2026-03-22", "training", 0, 0, [p])
+        row = self._row("2026-03-22", "#AAA")
+        self.assertEqual(row["period_type"], "warDay")
+
+    def test_period_type_drift_emits_warning(self):
+        p = participant("#AAA", "Alice", decks_used=4, fame=800)
+        bootbot.store_snapshot(self.conn, "2026-03-22", "warDay", 0, 0, [p])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            bootbot.store_snapshot(self.conn, "2026-03-22", "training", 0, 0, [p])
+
+        self.assertIn("[Data Warning] Period type changed for clash day 2026-03-22", buf.getvalue())
 
     def test_multiple_participants(self):
         parts = [
