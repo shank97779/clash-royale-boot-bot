@@ -8,14 +8,36 @@ Tables:
   sections          — one row per observed API section, ordered by first_seen_at
   section_snapshots — one row per (section, player_tag) with raw pulled stats
   section_members   — clan roster for a section
+
+Decks participation tracking
+-----------------------------
+The API field `decksUsedToday` is unreliable — it can be 0 in a snapshot even
+when `decksUsed` proves the player has already battled in that section (e.g. if
+they played before our first ingest run of a new section, or after whatever
+reset the API applies to that field).
+
+Instead we track participation via a delta:
+
+    decks_used - decks_used_initial
+
+`decks_used_initial` is the value of `decksUsed` from the very first snapshot
+captured for a player in a given section. The upsert in store_race_snapshot
+sets it on first insert and never overwrites it, so the delta accurately
+reflects how many decks were played within this section regardless of when
+`decksUsedToday` happened to be reset.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime
 
-DB_PATH = "boot-bot.db"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", "boot-bot.db")
 
 
 def get_db(path: str = DB_PATH) -> sqlite3.Connection:
@@ -39,17 +61,21 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_sections_sequence ON sections(sequence);
 
         CREATE TABLE IF NOT EXISTS section_snapshots (
-            period_index     INTEGER NOT NULL,
-            period_type      TEXT    NOT NULL,
-            section_index    INTEGER NOT NULL,
-            player_tag       TEXT    NOT NULL,
-            player_name      TEXT    NOT NULL,
-            fame             INTEGER NOT NULL DEFAULT 0,
-            repair_points    INTEGER NOT NULL DEFAULT 0,
-            boat_attacks     INTEGER NOT NULL DEFAULT 0,
-            decks_used       INTEGER NOT NULL DEFAULT 0,
-            decks_used_today INTEGER NOT NULL DEFAULT 0,
-            pulled_at        TEXT    NOT NULL,
+            period_index      INTEGER NOT NULL,
+            period_type       TEXT    NOT NULL,
+            section_index     INTEGER NOT NULL,
+            player_tag        TEXT    NOT NULL,
+            player_name       TEXT    NOT NULL,
+            fame              INTEGER NOT NULL DEFAULT 0,
+            repair_points     INTEGER NOT NULL DEFAULT 0,
+            boat_attacks      INTEGER NOT NULL DEFAULT 0,
+            decks_used        INTEGER NOT NULL DEFAULT 0,
+            -- decks_used_initial: value of decksUsed at section first-seen; used to compute
+            -- the within-section delta (decks_used - decks_used_initial) because
+            -- decksUsedToday can be 0 even when the player has already battled.
+            decks_used_initial INTEGER NOT NULL DEFAULT 0,
+            decks_used_today  INTEGER NOT NULL DEFAULT 0,
+            pulled_at         TEXT    NOT NULL,
             PRIMARY KEY (period_index, period_type, section_index, player_tag)
         );
 
@@ -163,23 +189,26 @@ def store_race_snapshot(
     section_index: int,
     participants: list,
 ) -> None:
-    """Store the latest raw participant values for a section."""
+    """Upsert participant values for a section, preserving decks_used_initial from first insert."""
     ensure_section(conn, pulled_at, period_index, period_type, section_index)
-    conn.execute(
-        """
-        DELETE FROM section_snapshots
-        WHERE period_index = ? AND period_type = ? AND section_index = ?
-        """,
-        (period_index, period_type, section_index),
-    )
 
     for participant in participants:
         conn.execute(
             """
             INSERT INTO section_snapshots
                 (period_index, period_type, section_index, player_tag, player_name,
-                 fame, repair_points, boat_attacks, decks_used, decks_used_today, pulled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fame, repair_points, boat_attacks, decks_used, decks_used_initial,
+                 decks_used_today, pulled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(period_index, period_type, section_index, player_tag) DO UPDATE SET
+                player_name      = excluded.player_name,
+                fame             = excluded.fame,
+                repair_points    = excluded.repair_points,
+                boat_attacks     = excluded.boat_attacks,
+                decks_used       = excluded.decks_used,
+                decks_used_today = excluded.decks_used_today,
+                pulled_at        = excluded.pulled_at
+                -- decks_used_initial is intentionally NOT updated after first insert
             """,
             (
                 period_index,
@@ -191,6 +220,7 @@ def store_race_snapshot(
                 participant.get("repairPoints", 0),
                 participant.get("boatAttacks", 0),
                 participant.get("decksUsed", 0),
+                participant.get("decksUsed", 0),  # decks_used_initial — only used on first insert
                 participant.get("decksUsedToday", 0),
                 pulled_at.isoformat(),
             ),

@@ -119,9 +119,9 @@ def find_non_participants(
             continue
 
         snap = snap_by_tag.get(tag)
-        decks_today = snap["decks_used_today"] if snap else 0
+        decks_section = (snap["decks_used"] - snap["decks_used_initial"]) if snap else 0
 
-        if decks_today < MIN_DECKS:
+        if decks_section < MIN_DECKS:
             action = ROLE_ACTIONS.get(m["role"], "Boot")
             first_seen = conn.execute(
                 """
@@ -140,9 +140,10 @@ def find_non_participants(
                 "tag":              tag,
                 "role":             m["role"],
                 "action":           action,
-                "decks_today":      decks_today,
+                "decks_section":    decks_section,
                 "fame":             snap["fame"]          if snap else 0,
                 "decks_used":       snap["decks_used"]    if snap else 0,
+                "trophies":         m["trophies"],
                 "first_seen_seq":   first_seen["seq"]     if first_seen else 0,
             })
 
@@ -276,8 +277,8 @@ def send_discord(
             lines.append(f"**{action}**")
             for c in group:
                 lines.append(
-                    f"• **{c['name']}** ({c['tag']}) [{c['role']}] — "
-                    f"{c['decks_today']}/{MIN_DECKS} decks | {c['fame']} fame"
+                    f"• **{c['name']}** [{c['trophies']:,}🏆] — "
+                    f"{c['decks_section']}/{MIN_DECKS} decks | {c['fame']} fame"
                 )
             lines.append("")
 
@@ -344,8 +345,8 @@ def print_report(
             print(f"\n  --- {action} ---")
             for c in group:
                 print(
-                    f"  {c['name']} ({c['tag']}) [{c['role']}]  "
-                    f"{c['decks_today']}/{MIN_DECKS} decks  {c['fame']} fame"
+                    f"  {c['name']} [{c['trophies']:,}🏆]  "
+                    f"{c['decks_section']}/{MIN_DECKS} decks  {c['fame']} fame"
                 )
 
     if promotion_candidates:
