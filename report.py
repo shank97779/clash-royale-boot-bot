@@ -15,8 +15,6 @@ Usage:
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -28,7 +26,6 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 CLAN_TAG     = os.getenv("CLAN_TAG", "#PJ8Q8P")
 DB_PATH      = os.getenv("DB_PATH",  db.DB_PATH)
-LOG_DIR         = os.getenv("LOG_DIR",         "logs")
 MIN_DECKS         = int(os.getenv("MIN_DECKS_PER_DAY",   "4"))
 PROMOTE_FAME      = int(os.getenv("PROMOTE_FAME",        "2000"))
 PROMOTE_WAR_COUNT = int(os.getenv("PROMOTE_WAR_COUNT",   "3"))
@@ -55,26 +52,6 @@ ROLE_ACTIONS = {
 }
 
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-
-def timestamp_key(ts: datetime) -> str:
-    return ts.strftime("%Y%m%dT%H%M%SZ")
-
-
-def run_log_path(ts: datetime) -> Path:
-    return Path(LOG_DIR) / "report" / f"{timestamp_key(ts)}_report.log"
-
-def log(msg: str) -> None:
-    line = msg.rstrip()
-    print(line)
-    if not hasattr(log, "_path"):
-        log._path = run_log_path(datetime.now(timezone.utc))
-    log_path = log._path
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 def find_non_participants(
@@ -96,10 +73,6 @@ def find_non_participants(
 
     period_type = snapshots[0]["period_type"]
     if period_type != "warDay":
-        log(
-            f"[report] {db.section_key(period_index, period_type, section_index)} "
-            f"is period_type='{period_type}', not 'warDay' — skipping"
-        )
         return []
 
     members    = db.get_members(conn, period_index, period_type, section_index)
@@ -115,7 +88,6 @@ def find_non_participants(
             continue
 
         if tag not in known_tags:
-            log(f"[report] GRACE  {name} ({tag}) — first day, skipping")
             continue
 
         snap = snap_by_tag.get(tag)
@@ -255,19 +227,12 @@ def _group_flagged(flagged: list[dict]) -> list[tuple[str, list[dict]]]:
 PODIUM_MEDALS = ["🥇", "🥈", "🥉"]
 
 
-def send_discord(
+def _build_lines(
     section_label: str,
     flagged: list[dict],
     top_performers: list[list[dict]],
     promotion_candidates: list[dict],
-) -> None:
-    if not DISCORD_WEBHOOK:
-        log("[report] DISCORD_WEBHOOK not set — skipping Discord send")
-        return
-
-    env_label = "PROD" if _env == "production" else "DEV"
-    log(f"[report] sending to Discord ({env_label})")
-
+) -> list[str]:
     lines = [f"**Action Required — Section {section_label}**", ""]
 
     if not flagged:
@@ -277,7 +242,7 @@ def send_discord(
             lines.append(f"**{action}**")
             for c in group:
                 lines.append(
-                    f"• **{c['name']}** [{c['trophies']:,}🏆] — "
+                    f"• **{c['name']}** [{c['trophies']:,}] — "
                     f"{c['decks_section']}/{MIN_DECKS} decks | {c['fame']} fame"
                 )
             lines.append("")
@@ -297,7 +262,23 @@ def send_discord(
             fame  = tier[0]["fame"]
             lines.append(f"{medal} {names} — {fame} fame")
 
-    content = "\n".join(lines)
+    return lines
+
+
+def send_discord(
+    section_label: str,
+    flagged: list[dict],
+    top_performers: list[list[dict]],
+    promotion_candidates: list[dict],
+) -> None:
+    if not DISCORD_WEBHOOK:
+        print("DISCORD_WEBHOOK not set — skipping Discord send")
+        return
+
+    env_label = "PROD" if _env == "production" else "DEV"
+    print(f"Sending to Discord ({env_label})...")
+
+    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates))
 
     # Discord messages cap at 2000 chars; split on newlines only.
     chunks: list[str] = []
@@ -323,12 +304,10 @@ def send_discord(
         )
         resp.raise_for_status()
 
-    log(f"[report] Discord message sent ({len(flagged)} flagged)")
+    print(f"Discord message sent ({len(flagged)} flagged)")
 
 
 # ── Console ────────────────────────────────────────────────────────────────────
-
-PODIUM_LABELS = ["1st", "2nd", "3rd"]
 
 
 def print_report(
@@ -337,30 +316,7 @@ def print_report(
     top_performers: list[list[dict]],
     promotion_candidates: list[dict],
 ) -> None:
-    print(f"\n=== Action Required — Section {section_label} ===")
-    if not flagged:
-        print("  No action required. Everyone participated!")
-    else:
-        for action, group in _group_flagged(flagged):
-            print(f"\n  --- {action} ---")
-            for c in group:
-                print(
-                    f"  {c['name']} [{c['trophies']:,}🏆]  "
-                    f"{c['decks_section']}/{MIN_DECKS} decks  {c['fame']} fame"
-                )
-
-    if promotion_candidates:
-        print(f"\n=== Promote to Elder ({PROMOTE_WAR_COUNT} wars >= {PROMOTE_FAME} fame) ===")
-        for c in promotion_candidates:
-            print(f"  {c['name']} ({c['tag']})")
-
-    if top_performers:
-        print("\n=== Top Performers ===")
-        for i, tier in enumerate(top_performers):
-            label = PODIUM_LABELS[i]
-            names = ", ".join(f"{p['name']} ({p['tag']})" for p in tier)
-            fame  = tier[0]["fame"]
-            print(f"  {label}: {names} — {fame} fame")
+    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates)))
     print()
 
 
@@ -383,10 +339,6 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print report but do not send to Discord.")
     args = parser.parse_args()
 
-    now_utc = datetime.now(timezone.utc)
-    log._path = run_log_path(now_utc)
-    ts_str  = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-
     conn = db.get_db(DB_PATH)
     db.init_db(conn)
 
@@ -396,7 +348,7 @@ def main() -> None:
     else:
         latest_section = db.latest_completed_war_section(conn)
         if latest_section is None:
-            log("[report] No completed war section found yet. Run ingest.py over at least two API sections first.")
+            print("No completed war section found yet. Run ingest.py over at least two API sections first.")
             conn.close()
             sys.exit(1)
         period_index = latest_section["period_index"]
@@ -405,24 +357,15 @@ def main() -> None:
 
     section_label = db.section_key(period_index, period_type, section_index)
 
-    log(f"[{ts_str}] report | section={section_label}")
-
     snapshots = db.get_snapshot(conn, period_index, period_type, section_index)
     if not snapshots:
-        log(f"[report] No snapshot data found for {section_label}. Run ingest.py first.")
+        print(f"No snapshot data found for {section_label}. Run ingest.py first.")
         conn.close()
         sys.exit(1)
 
     flagged               = find_non_participants(conn, period_index, period_type, section_index)
     top_performers        = find_top_performers(snapshots)
     promotion_candidates  = find_promotion_candidates(conn, period_index, period_type, section_index)
-
-    for c in promotion_candidates:
-        log(f"[report] PROMOTE | name={c['name']} | tag={c['tag']}")
-    for i, tier in enumerate(top_performers):
-        label = PODIUM_LABELS[i]
-        for p in tier:
-            log(f"[report] SHOUTOUT {label} | name={p['name']} | tag={p['tag']} | fame={p['fame']}")
 
     print_report(section_label, flagged, top_performers, promotion_candidates)
 
