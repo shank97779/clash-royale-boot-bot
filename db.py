@@ -12,19 +12,18 @@ Tables:
 Decks participation tracking
 -----------------------------
 The API field `decksUsedToday` is unreliable — it can be 0 in a snapshot even
-when `decksUsed` proves the player has already battled in that section (e.g. if
-they played before our first ingest run of a new section, or after whatever
-reset the API applies to that field).
+when `decksUsed` proves the player has already battled in that section.
 
-Instead we track participation via a delta:
+`decksUsed` is cumulative across the entire war weekend (e.g. 4 → 8 → 12 → 16
+across four war days). Participation in a given section is therefore:
 
     decks_used - decks_used_initial
 
-`decks_used_initial` is the value of `decksUsed` from the very first snapshot
-captured for a player in a given section. The upsert in store_race_snapshot
-sets it on first insert and never overwrites it, so the delta accurately
-reflects how many decks were played within this section regardless of when
-`decksUsedToday` happened to be reset.
+`decks_used_initial` is seeded on first insert from the player's most recent
+`decks_used` in any earlier section (i.e. end of the previous war day). This
+correctly handles players who battle between the section rollover and our first
+ingest of the new section. If the previous value exceeds the current one (a new
+war weekend where the counter resets), we fall back to 0.
 """
 
 from __future__ import annotations
@@ -189,10 +188,47 @@ def store_race_snapshot(
     section_index: int,
     participants: list,
 ) -> None:
-    """Upsert participant values for a section, preserving decks_used_initial from first insert."""
+    """Upsert participant values for a section, preserving decks_used_initial from first insert.
+
+    decks_used is cumulative across the entire war weekend, so the correct baseline
+    for a new section is the player's decks_used from the end of the previous section
+    (not the current snapshot value). This correctly handles players who battle between
+    the section rollover and our first ingest of the new section.
+
+    If no prior section data exists, or the previous value exceeds the current one
+    (indicating a new war weekend reset), we fall back to 0.
+    """
     ensure_section(conn, pulled_at, period_index, period_type, section_index)
 
     for participant in participants:
+        current_decks = participant.get("decksUsed", 0)
+
+        # Look up this player's most recent decks_used from any earlier section.
+        prev = conn.execute(
+            """
+            SELECT ss.decks_used
+            FROM section_snapshots ss
+            JOIN sections s ON  s.period_index  = ss.period_index
+                            AND s.period_type   = ss.period_type
+                            AND s.section_index = ss.section_index
+            WHERE ss.player_tag = ?
+              AND s.sequence < (
+                  SELECT sequence FROM sections
+                  WHERE period_index = ? AND period_type = ? AND section_index = ?
+              )
+            ORDER BY s.sequence DESC
+            LIMIT 1
+            """,
+            (participant["tag"], period_index, period_type, section_index),
+        ).fetchone()
+
+        # Use prev as the baseline if it's ≤ current (normal accumulation).
+        # If prev > current the war weekend reset and decks restarted from 0.
+        if prev is not None and prev["decks_used"] <= current_decks:
+            initial = prev["decks_used"]
+        else:
+            initial = 0
+
         conn.execute(
             """
             INSERT INTO section_snapshots
@@ -219,8 +255,8 @@ def store_race_snapshot(
                 participant.get("fame", 0),
                 participant.get("repairPoints", 0),
                 participant.get("boatAttacks", 0),
-                participant.get("decksUsed", 0),
-                participant.get("decksUsed", 0),  # decks_used_initial — only used on first insert
+                current_decks,
+                initial,
                 participant.get("decksUsedToday", 0),
                 pulled_at.isoformat(),
             ),
