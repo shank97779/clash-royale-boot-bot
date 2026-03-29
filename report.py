@@ -260,10 +260,10 @@ def _build_lines(
         for action, group in _group_flagged(flagged):
             lines.append(f"**{action}**")
             for c in group:
-                new_note = f" *(joined day {c['excused'] + 1})*" if c['excused'] else ""
+                new_note = f" *(joined day {c['excused']})*" if c['excused'] else ""
                 lines.append(
-                    f"• **{c['name']}**{new_note} [{c['trophies']:,}] — "
-                    f"{c['decks_used']}/{c['max_decks']} decks (today: {c['decks_today']}) | {c['fame']} fame"
+                    f"• **{c['name']}** [{c['trophies']:,}] — "
+                    f"{c['decks_used']}/{c['max_decks']} decks (yest: {c['decks_today']}) | {c['fame']} fame{new_note}"
                 )
             lines.append("")
 

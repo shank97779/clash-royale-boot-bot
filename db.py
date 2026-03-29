@@ -221,33 +221,47 @@ def days_excused(
     weekend_sequences: list[int],
 ) -> int:
     """
-    Return the number of war day sections in weekend_sequences where the
-    player was not yet in the clan roster (i.e. they joined on or after that
-    section). This includes their join day — they get credit for it.
+    Return the number of war day sections the player is excused from.
 
-    A player is considered present for a section if they appear in
-    section_members for that section.
+    A player is excused for all days up to and including their first day in
+    the clan (their join day is a free pass). Days after that count toward
+    the required deck total.
+
+    If the player never appears in any of the weekend sections, all days are
+    excused (e.g. they left mid-weekend).
     """
     if not weekend_sequences:
         return 0
 
     placeholders = ",".join("?" * len(weekend_sequences))
-    rows = conn.execute(
+
+    # Find the sequence of the player's first appearance this weekend.
+    first = conn.execute(
         f"""
-        SELECT s.sequence
+        SELECT MIN(s.sequence) AS first_seq
         FROM sections s
+        JOIN section_members sm
+          ON sm.period_index  = s.period_index
+         AND sm.period_type   = s.period_type
+         AND sm.section_index = s.section_index
         WHERE s.sequence IN ({placeholders})
-          AND NOT EXISTS (
-              SELECT 1 FROM section_members sm
-              WHERE sm.period_index  = s.period_index
-                AND sm.period_type   = s.period_type
-                AND sm.section_index = s.section_index
-                AND sm.player_tag    = ?
-          )
+          AND sm.player_tag = ?
         """,
         (*weekend_sequences, player_tag),
-    ).fetchall()
-    return len(rows)
+    ).fetchone()
+
+    first_seq = first["first_seq"] if first and first["first_seq"] is not None else None
+
+    if first_seq is None:
+        # Player never appeared — excuse all days.
+        return len(weekend_sequences)
+
+    if first_seq == weekend_sequences[0]:
+        # Player was present from the start of the war weekend — not a new joiner.
+        return 0
+
+    # New joiner: excuse every day up to and including their first appearance.
+    return sum(1 for s in weekend_sequences if s <= first_seq)
 
 
 def store_race_snapshot(
