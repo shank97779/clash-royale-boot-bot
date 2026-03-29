@@ -7,7 +7,7 @@ from pathlib import Path
 
 import db
 import ingest
-from report import EXEMPT_TAGS, MIN_DECKS, find_non_participants
+from report import EXEMPT_TAGS, MIN_DECKS, find_non_participants, find_top_performers
 
 
 def make_conn() -> sqlite3.Connection:
@@ -176,30 +176,6 @@ class TestStoreMemberSnapshot:
         assert {row["player_tag"] for row in rows} == {"#BBB"}
 
 
-class TestKnownTagsBefore:
-    def test_returns_only_tags_from_prior_sections(self):
-        conn = make_conn()
-        store_section(
-            conn,
-            seen_at=datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),
-            period_index=25,
-            period_type="warDay",
-            section_index=0,
-            participants=[{"tag": "#AAA", "name": "Alice"}],
-        )
-        store_section(
-            conn,
-            seen_at=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
-            period_index=25,
-            period_type="warDay",
-            section_index=1,
-            participants=[{"tag": "#BBB", "name": "Bob"}],
-        )
-
-        prior = db.known_tags_before(conn, 25, "warDay", 1)
-        assert prior == {"#AAA"}
-
-
 class TestIngestFiles:
     def test_run_log_path_uses_timestamped_filename(self):
         ts = datetime(2026, 3, 27, 10, 5, tzinfo=timezone.utc)
@@ -259,6 +235,7 @@ class TestIngestFiles:
                         "decksUsedToday": 2,
                     },
                 ],
+                "25:warDay:3",
             )
         finally:
             if had_path:
@@ -268,8 +245,8 @@ class TestIngestFiles:
 
         lines = log_path.read_text(encoding="utf-8").splitlines()
         assert lines == [
-            "[member] name=Alice | tag=#AAA | role=elder | exp=14 | trophies=7000 | in_race=yes | fame=400 | repair=0 | boat_attacks=1 | decks_used=4 | decks_today=2",
-            "[member] name=Bob | tag=#BBB | role=member | exp=13 | trophies=6500 | in_race=no | fame=na | repair=na | boat_attacks=na | decks_used=na | decks_today=na",
+            "[member] section=25:warDay:3 | name=Alice | tag=#AAA | role=elder | exp=14 | trophies=7000 | in_race=yes | fame=400 | repair=0 | boat_attacks=1 | decks_used=4 | decks_today=2",
+            "[member] section=25:warDay:3 | name=Bob | tag=#BBB | role=member | exp=13 | trophies=6500 | in_race=no | fame=na | repair=na | boat_attacks=na | decks_used=na | decks_today=na",
         ]
 
 
@@ -297,16 +274,33 @@ class TestFindNonParticipants:
 
     def test_grace_period_skips_new_member(self):
         conn = make_conn()
+        # A prior war day exists with a different member — NewGuy wasn't in the clan yet.
+        store_section(
+            conn,
+            seen_at=datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),
+            period_index=25,
+            period_type="warDay",
+            section_index=0,
+            participants=[{"tag": "#OTHER", "name": "Other", "decksUsedToday": 4, "decksUsed": 4}],
+            members=[{"tag": "#OTHER", "name": "Other", "role": "member"}],
+        )
+        # NewGuy joins on day 2 (their first and join day) — both days are excused.
         store_section(
             conn,
             seen_at=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
             period_index=25,
             period_type="warDay",
             section_index=1,
-            participants=[{"tag": "#NEW", "name": "NewGuy", "decksUsedToday": 0}],
-            members=[{"tag": "#NEW", "name": "NewGuy", "role": "member"}],
+            participants=[{"tag": "#NEW", "name": "NewGuy", "decksUsedToday": 0, "decksUsed": 0}],
+            members=[
+                {"tag": "#OTHER", "name": "Other", "role": "member"},
+                {"tag": "#NEW", "name": "NewGuy", "role": "member"},
+            ],
         )
-        assert find_non_participants(conn, *SECTION) == []
+        # NewGuy owes 0 days (both days excused: day 1 absent + day 2 is join day).
+        result = find_non_participants(conn, *SECTION)
+        new_guy = [r for r in result if r["tag"] == "#NEW"]
+        assert new_guy == []
 
     def test_flags_low_participation(self):
         conn = make_conn()
@@ -387,6 +381,44 @@ class TestFindNonParticipants:
             EXEMPT_TAGS.clear()
             EXEMPT_TAGS.update(original)
 
+    def test_removed_member_not_flagged(self):
+        conn = make_conn()
+        # Day 1: both Alice and Bob are in the clan, both participate.
+        store_section(
+            conn,
+            seen_at=datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),
+            period_index=25,
+            period_type="warDay",
+            section_index=0,
+            participants=[
+                {"tag": "#AAA", "name": "Alice", "decksUsedToday": 4, "decksUsed": 4},
+                {"tag": "#BOB", "name": "Bob",   "decksUsedToday": 4, "decksUsed": 4},
+            ],
+            members=[
+                {"tag": "#AAA", "name": "Alice", "role": "member"},
+                {"tag": "#BOB", "name": "Bob",   "role": "member"},
+            ],
+        )
+        # Day 2: Bob has been removed from the clan. Alice used 0 decks.
+        store_section(
+            conn,
+            seen_at=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+            period_index=25,
+            period_type="warDay",
+            section_index=1,
+            participants=[
+                {"tag": "#AAA", "name": "Alice", "decksUsedToday": 0, "decksUsed": 4, "fame": 100},
+            ],
+            members=[
+                {"tag": "#AAA", "name": "Alice", "role": "member"},
+                # Bob is not in the current roster
+            ],
+        )
+        result = find_non_participants(conn, *SECTION)
+        tags = [r["tag"] for r in result]
+        assert "#BOB" not in tags  # already removed, not our problem
+        assert "#AAA" in tags      # Alice is still in clan and underperformed
+
     def test_sorted_by_decks_then_fame(self):
         conn = make_conn()
         for seen_at, section_index in [
@@ -433,7 +465,119 @@ class TestFindNonParticipants:
             period_index=25,
             period_type="warDay",
             section_index=1,
-            participants=[{"tag": "#AAA", "name": "Alice", "decksUsedToday": MIN_DECKS, "decksUsed": MIN_DECKS}],
+            participants=[{"tag": "#AAA", "name": "Alice", "decksUsedToday": MIN_DECKS, "decksUsed": 2 * MIN_DECKS}],
             members=[{"tag": "#AAA", "name": "Alice", "role": "member"}],
         )
         assert find_non_participants(conn, *SECTION) == []
+
+
+class TestWarWeekendSections:
+    def test_returns_all_war_days_in_weekend(self):
+        conn = make_conn()
+        for i, seen_at in enumerate([
+            datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 27, 10, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 28, 10, 0, tzinfo=timezone.utc),
+        ]):
+            store_section(conn, seen_at=seen_at, period_index=25 + i, period_type="warDay", section_index=3)
+
+        rows = db.war_weekend_sections(conn, 27, "warDay", 3)
+        assert [(r["period_index"], r["period_type"]) for r in rows] == [
+            (25, "warDay"), (26, "warDay"), (27, "warDay")
+        ]
+
+    def test_stops_at_training_boundary(self):
+        conn = make_conn()
+        # previous war weekend
+        store_section(conn, seen_at=datetime(2026, 3, 19, 10, 0, tzinfo=timezone.utc),
+                      period_index=21, period_type="warDay", section_index=3)
+        # training section between weekends
+        store_section(conn, seen_at=datetime(2026, 3, 23, 10, 0, tzinfo=timezone.utc),
+                      period_index=24, period_type="training", section_index=3)
+        # current war weekend
+        store_section(conn, seen_at=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc),
+                      period_index=25, period_type="warDay", section_index=3)
+        store_section(conn, seen_at=datetime(2026, 3, 27, 10, 0, tzinfo=timezone.utc),
+                      period_index=26, period_type="warDay", section_index=3)
+
+        rows = db.war_weekend_sections(conn, 26, "warDay", 3)
+        assert len(rows) == 2
+        assert rows[0]["period_index"] == 25
+        assert rows[1]["period_index"] == 26
+
+    def test_returns_empty_for_unknown_section(self):
+        conn = make_conn()
+        assert db.war_weekend_sections(conn, 99, "warDay", 3) == []
+
+
+class TestDaysExcused:
+    def _make_weekend(self, conn):
+        """Store two war days and return their sequences."""
+        store_section(conn, seen_at=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc),
+                      period_index=25, period_type="warDay", section_index=3,
+                      members=[{"tag": "#VET", "name": "Vet", "role": "member"}])
+        store_section(conn, seen_at=datetime(2026, 3, 27, 10, 0, tzinfo=timezone.utc),
+                      period_index=26, period_type="warDay", section_index=3,
+                      members=[
+                          {"tag": "#VET",  "name": "Vet",    "role": "member"},
+                          {"tag": "#NEW",  "name": "NewGuy", "role": "member"},
+                      ])
+        rows = db.war_weekend_sections(conn, 26, "warDay", 3)
+        return [r["sequence"] for r in rows]
+
+    def test_veteran_has_zero_excused(self):
+        conn = make_conn()
+        seqs = self._make_weekend(conn)
+        assert db.days_excused(conn, "#VET", seqs) == 0
+
+    def test_joiner_on_day2_excused_both_days(self):
+        conn = make_conn()
+        seqs = self._make_weekend(conn)
+        # #NEW first appears day 2 → days 1 and 2 both excused
+        assert db.days_excused(conn, "#NEW", seqs) == 2
+
+    def test_player_never_in_roster_excused_all(self):
+        conn = make_conn()
+        seqs = self._make_weekend(conn)
+        assert db.days_excused(conn, "#GHOST", seqs) == 2
+
+    def test_empty_sequences_returns_zero(self):
+        conn = make_conn()
+        assert db.days_excused(conn, "#ANY", []) == 0
+
+
+class TestFindTopPerformers:
+    def test_top_three_tiers(self):
+        snaps = [
+            {"player_name": "Alice", "player_tag": "#A", "fame": 1800},
+            {"player_name": "Bob",   "player_tag": "#B", "fame": 1600},
+            {"player_name": "Carol", "player_tag": "#C", "fame": 1400},
+            {"player_name": "Dave",  "player_tag": "#D", "fame": 1200},
+        ]
+        tiers = find_top_performers(snaps)
+        assert len(tiers) == 3
+        assert tiers[0][0]["name"] == "Alice"
+        assert tiers[1][0]["name"] == "Bob"
+        assert tiers[2][0]["name"] == "Carol"
+
+    def test_tied_players_share_tier(self):
+        snaps = [
+            {"player_name": "Alice", "player_tag": "#A", "fame": 1800},
+            {"player_name": "Bob",   "player_tag": "#B", "fame": 1600},
+            {"player_name": "Carol", "player_tag": "#C", "fame": 1600},
+        ]
+        tiers = find_top_performers(snaps)
+        assert len(tiers) == 2
+        assert len(tiers[1]) == 2
+        tier2_names = {p["name"] for p in tiers[1]}
+        assert tier2_names == {"Bob", "Carol"}
+
+    def test_zero_fame_excluded(self):
+        snaps = [
+            {"player_name": "Alice", "player_tag": "#A", "fame": 0},
+            {"player_name": "Bob",   "player_tag": "#B", "fame": 0},
+        ]
+        assert find_top_performers(snaps) == []
+
+    def test_empty_snapshots(self):
+        assert find_top_performers([]) == []

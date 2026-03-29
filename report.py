@@ -138,7 +138,7 @@ def find_non_participants(
                 "first_seen_seq": first_seen["seq"] if first_seen else 0,
             })
 
-    flagged.sort(key=lambda c: c["first_seen_seq"], reverse=True)
+    flagged.sort(key=lambda c: (c["decks_used"], c["fame"]))
     return flagged
 
 
