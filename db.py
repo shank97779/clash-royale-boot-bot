@@ -11,19 +11,12 @@ Tables:
 
 Decks participation tracking
 -----------------------------
-The API field `decksUsedToday` is unreliable — it can be 0 in a snapshot even
-when `decksUsed` proves the player has already battled in that section.
+`decksUsed` in the API is cumulative across the entire war weekend
+(e.g. 4 → 8 → 12 → 16 across four war days).
 
-`decksUsed` is cumulative across the entire war weekend (e.g. 4 → 8 → 12 → 16
-across four war days). Participation in a given section is therefore:
-
-    decks_used - decks_used_initial
-
-`decks_used_initial` is seeded on first insert from the player's most recent
-`decks_used` in any earlier section (i.e. end of the previous war day). This
-correctly handles players who battle between the section rollover and our first
-ingest of the new section. If the previous value exceeds the current one (a new
-war weekend where the counter resets), we fall back to 0.
+Participation is evaluated in report.py by comparing a player's cumulative
+`decks_used` against `required = owed_days * MIN_DECKS`, where owed_days =
+completed war days minus any days the player wasn't yet in the clan.
 """
 
 from __future__ import annotations
@@ -69,10 +62,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             repair_points     INTEGER NOT NULL DEFAULT 0,
             boat_attacks      INTEGER NOT NULL DEFAULT 0,
             decks_used        INTEGER NOT NULL DEFAULT 0,
-            -- decks_used_initial: value of decksUsed at section first-seen; used to compute
-            -- the within-section delta (decks_used - decks_used_initial) because
-            -- decksUsedToday can be 0 even when the player has already battled.
-            decks_used_initial INTEGER NOT NULL DEFAULT 0,
             decks_used_today  INTEGER NOT NULL DEFAULT 0,
             pulled_at         TEXT    NOT NULL,
             PRIMARY KEY (period_index, period_type, section_index, player_tag)
@@ -180,6 +169,87 @@ def latest_completed_war_section(conn: sqlite3.Connection) -> sqlite3.Row | None
     ).fetchone()
 
 
+def war_weekend_sections(
+    conn: sqlite3.Connection,
+    period_index: int,
+    period_type: str,
+    section_index: int,
+) -> list[sqlite3.Row]:
+    """
+    Return all warDay sections in the same war weekend as the given section,
+    in sequence order (oldest first), up to and including the given section.
+
+    A war weekend is bounded by the nearest preceding non-warDay section
+    (i.e. a training period). If there is no such boundary we include all
+    warDay sections up to the given one.
+    """
+    target = conn.execute(
+        "SELECT sequence FROM sections WHERE period_index=? AND period_type=? AND section_index=?",
+        (period_index, period_type, section_index),
+    ).fetchone()
+    if target is None:
+        return []
+
+    # Find the sequence of the most recent non-warDay section before the target.
+    boundary = conn.execute(
+        """
+        SELECT COALESCE(MAX(sequence), 0) AS seq
+        FROM sections
+        WHERE period_type != 'warDay'
+          AND sequence < ?
+        """,
+        (target["sequence"],),
+    ).fetchone()
+    boundary_seq = boundary["seq"] if boundary else 0
+
+    return conn.execute(
+        """
+        SELECT period_index, period_type, section_index, sequence, first_seen_at
+        FROM sections
+        WHERE period_type = 'warDay'
+          AND sequence >  ?
+          AND sequence <= ?
+        ORDER BY sequence ASC
+        """,
+        (boundary_seq, target["sequence"]),
+    ).fetchall()
+
+
+def days_excused(
+    conn: sqlite3.Connection,
+    player_tag: str,
+    weekend_sequences: list[int],
+) -> int:
+    """
+    Return the number of war day sections in weekend_sequences where the
+    player was not yet in the clan roster (i.e. they joined on or after that
+    section). This includes their join day — they get credit for it.
+
+    A player is considered present for a section if they appear in
+    section_members for that section.
+    """
+    if not weekend_sequences:
+        return 0
+
+    placeholders = ",".join("?" * len(weekend_sequences))
+    rows = conn.execute(
+        f"""
+        SELECT s.sequence
+        FROM sections s
+        WHERE s.sequence IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM section_members sm
+              WHERE sm.period_index  = s.period_index
+                AND sm.period_type   = s.period_type
+                AND sm.section_index = s.section_index
+                AND sm.player_tag    = ?
+          )
+        """,
+        (*weekend_sequences, player_tag),
+    ).fetchall()
+    return len(rows)
+
+
 def store_race_snapshot(
     conn: sqlite3.Connection,
     pulled_at: datetime,
@@ -188,54 +258,16 @@ def store_race_snapshot(
     section_index: int,
     participants: list,
 ) -> None:
-    """Upsert participant values for a section, preserving decks_used_initial from first insert.
-
-    decks_used is cumulative across the entire war weekend, so the correct baseline
-    for a new section is the player's decks_used from the end of the previous section
-    (not the current snapshot value). This correctly handles players who battle between
-    the section rollover and our first ingest of the new section.
-
-    If no prior section data exists, or the previous value exceeds the current one
-    (indicating a new war weekend reset), we fall back to 0.
-    """
+    """Upsert participant stats for a section."""
     ensure_section(conn, pulled_at, period_index, period_type, section_index)
 
     for participant in participants:
-        current_decks = participant.get("decksUsed", 0)
-
-        # Look up this player's most recent decks_used from any earlier section.
-        prev = conn.execute(
-            """
-            SELECT ss.decks_used
-            FROM section_snapshots ss
-            JOIN sections s ON  s.period_index  = ss.period_index
-                            AND s.period_type   = ss.period_type
-                            AND s.section_index = ss.section_index
-            WHERE ss.player_tag = ?
-              AND s.sequence < (
-                  SELECT sequence FROM sections
-                  WHERE period_index = ? AND period_type = ? AND section_index = ?
-              )
-            ORDER BY s.sequence DESC
-            LIMIT 1
-            """,
-            (participant["tag"], period_index, period_type, section_index),
-        ).fetchone()
-
-        # Use prev as the baseline if it's ≤ current (normal accumulation).
-        # If prev > current the war weekend reset and decks restarted from 0.
-        if prev is not None and prev["decks_used"] <= current_decks:
-            initial = prev["decks_used"]
-        else:
-            initial = 0
-
         conn.execute(
             """
             INSERT INTO section_snapshots
                 (period_index, period_type, section_index, player_tag, player_name,
-                 fame, repair_points, boat_attacks, decks_used, decks_used_initial,
-                 decks_used_today, pulled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fame, repair_points, boat_attacks, decks_used, decks_used_today, pulled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(period_index, period_type, section_index, player_tag) DO UPDATE SET
                 player_name      = excluded.player_name,
                 fame             = excluded.fame,
@@ -244,7 +276,6 @@ def store_race_snapshot(
                 decks_used       = excluded.decks_used,
                 decks_used_today = excluded.decks_used_today,
                 pulled_at        = excluded.pulled_at
-                -- decks_used_initial is intentionally NOT updated after first insert
             """,
             (
                 period_index,
@@ -255,8 +286,7 @@ def store_race_snapshot(
                 participant.get("fame", 0),
                 participant.get("repairPoints", 0),
                 participant.get("boatAttacks", 0),
-                current_decks,
-                initial,
+                participant.get("decksUsed", 0),
                 participant.get("decksUsedToday", 0),
                 pulled_at.isoformat(),
             ),
@@ -338,37 +368,5 @@ def get_members(
         """,
         (period_index, period_type, section_index),
     ).fetchall()
-
-
-def known_tags_before(
-    conn: sqlite3.Connection,
-    period_index: int,
-    period_type: str,
-    section_index: int,
-) -> set[str]:
-    current = conn.execute(
-        """
-        SELECT sequence
-        FROM sections
-        WHERE period_index = ? AND period_type = ? AND section_index = ?
-        """,
-        (period_index, period_type, section_index),
-    ).fetchone()
-    if current is None:
-        return set()
-
-    rows = conn.execute(
-        """
-        SELECT DISTINCT ss.player_tag
-        FROM section_snapshots ss
-        JOIN sections s
-          ON s.period_index = ss.period_index
-         AND s.period_type = ss.period_type
-         AND s.section_index = ss.section_index
-        WHERE s.sequence < ?
-        """,
-        (current["sequence"],),
-    ).fetchall()
-    return {row["player_tag"] for row in rows}
 
 

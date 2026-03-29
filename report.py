@@ -27,6 +27,7 @@ load_dotenv()
 CLAN_TAG     = os.getenv("CLAN_TAG", "#PJ8Q8P")
 DB_PATH      = os.getenv("DB_PATH",  db.DB_PATH)
 MIN_DECKS         = int(os.getenv("MIN_DECKS_PER_DAY",   "4"))
+MAX_DECKS_PER_DAY = 4  # Clash Royale war day maximum — not configurable
 PROMOTE_FAME      = int(os.getenv("PROMOTE_FAME",        "2000"))
 PROMOTE_WAR_COUNT = int(os.getenv("PROMOTE_WAR_COUNT",   "3"))
 
@@ -61,23 +62,31 @@ def find_non_participants(
     section_index: int,
 ) -> list[dict]:
     """
-    Returns members who used fewer than MIN_DECKS on the given war day.
+    Returns members who haven't used enough decks across the war weekend.
 
-    - Only runs against warDay snapshots.
-    - New members (no prior snapshot before this day) get a grace pass.
-    - Exempt tags are always skipped.
+    Evaluation is cumulative over the whole weekend, not per-day:
+      required = (completed_war_days - days_excused) * MIN_DECKS
+      flag if decks_used < required
+
+    days_excused = number of war day sections where the player wasn't in the
+    clan roster yet, including their join day (so new members owe nothing on
+    the day they join and catch up at 4/day from the next day).
+
+    Exempt tags are always skipped.
     """
     snapshots = db.get_snapshot(conn, period_index, period_type, section_index)
     if not snapshots:
         return []
 
-    period_type = snapshots[0]["period_type"]
-    if period_type != "warDay":
+    if snapshots[0]["period_type"] != "warDay":
         return []
 
-    members    = db.get_members(conn, period_index, period_type, section_index)
-    known_tags = db.known_tags_before(conn, period_index, period_type, section_index)
+    members     = db.get_members(conn, period_index, period_type, section_index)
     snap_by_tag = {row["player_tag"]: row for row in snapshots}
+
+    weekend_sections  = db.war_weekend_sections(conn, period_index, period_type, section_index)
+    weekend_sequences = [s["sequence"] for s in weekend_sections]
+    completed_days    = len(weekend_sections)
 
     flagged = []
     for m in members:
@@ -87,13 +96,19 @@ def find_non_participants(
         if tag.upper() in EXEMPT_TAGS:
             continue
 
-        if tag not in known_tags:
-            continue
+        excused   = db.days_excused(conn, tag, weekend_sequences)
+        owed      = completed_days - excused
+        required  = owed * MIN_DECKS
+        max_decks = owed * MAX_DECKS_PER_DAY
 
-        snap = snap_by_tag.get(tag)
-        decks_section = (snap["decks_used"] - snap["decks_used_initial"]) if snap else 0
+        if required <= 0:
+            continue  # brand-new — owes nothing yet
 
-        if decks_section < MIN_DECKS:
+        snap            = snap_by_tag.get(tag)
+        decks_used      = snap["decks_used"]       if snap else 0
+        decks_used_today = snap["decks_used_today"] if snap else 0
+
+        if decks_used < required:
             action = ROLE_ACTIONS.get(m["role"], "Boot")
             first_seen = conn.execute(
                 """
@@ -108,20 +123,24 @@ def find_non_participants(
                 (tag,),
             ).fetchone()
             flagged.append({
-                "name":             name,
-                "tag":              tag,
-                "role":             m["role"],
-                "action":           action,
-                "decks_section":    decks_section,
-                "fame":             snap["fame"]          if snap else 0,
-                "decks_used":       snap["decks_used"]    if snap else 0,
-                "trophies":         m["trophies"],
-                "first_seen_seq":   first_seen["seq"]     if first_seen else 0,
+                "name":           name,
+                "tag":            tag,
+                "role":           m["role"],
+                "action":         action,
+                "decks_used":      decks_used,
+                "decks_today":     decks_used_today,
+                "required":       required,
+                "max_decks":      max_decks,
+                "owed_days":      owed,
+                "excused":        excused,
+                "fame":           snap["fame"] if snap else 0,
+                "trophies":       m["trophies"],
+                "first_seen_seq": first_seen["seq"] if first_seen else 0,
             })
 
-    # Newest members (highest first-seen sequence) at top, oldest at bottom.
     flagged.sort(key=lambda c: c["first_seen_seq"], reverse=True)
     return flagged
+
 
 
 def find_promotion_candidates(
@@ -241,9 +260,10 @@ def _build_lines(
         for action, group in _group_flagged(flagged):
             lines.append(f"**{action}**")
             for c in group:
+                new_note = f" *(joined day {c['excused'] + 1})*" if c['excused'] else ""
                 lines.append(
-                    f"• **{c['name']}** [{c['trophies']:,}] — "
-                    f"{c['decks_section']}/{MIN_DECKS} decks | {c['fame']} fame"
+                    f"• **{c['name']}**{new_note} [{c['trophies']:,}] — "
+                    f"{c['decks_used']}/{c['max_decks']} decks (today: {c['decks_today']}) | {c['fame']} fame"
                 )
             lines.append("")
 
@@ -265,6 +285,27 @@ def _build_lines(
     return lines
 
 
+def _split_content(content: str, max_len: int = 1990) -> list[str]:
+    """Split content into chunks no larger than max_len at line boundaries."""
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for line in content.split("\n"):
+        needed = len(line) + (1 if current_lines else 0)
+        if current_lines and current_len + needed > max_len:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(line)
+        else:
+            current_lines.append(line)
+            current_len += needed
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks
+
+
 def send_discord(
     section_label: str,
     flagged: list[dict],
@@ -279,29 +320,8 @@ def send_discord(
     print(f"Sending to Discord ({env_label})...")
 
     content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates))
-
-    # Discord messages cap at 2000 chars; split on newlines only.
-    chunks: list[str] = []
-    current_lines: list[str] = []
-    current_len = 0
-    for line in content.split("\n"):
-        # +1 for the newline that join will add
-        needed = len(line) + (1 if current_lines else 0)
-        if current_lines and current_len + needed > 1990:
-            chunks.append("\n".join(current_lines))
-            current_lines = [line]
-            current_len = len(line)
-        else:
-            current_lines.append(line)
-            current_len += needed
-    if current_lines:
-        chunks.append("\n".join(current_lines))
-    for chunk in chunks:
-        resp = requests.post(
-            DISCORD_WEBHOOK,
-            json={"content": chunk},
-            timeout=10,
-        )
+    for chunk in _split_content(content):
+        resp = requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
         resp.raise_for_status()
 
     print(f"Discord message sent ({len(flagged)} flagged)")
