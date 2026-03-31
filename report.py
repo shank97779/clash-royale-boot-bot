@@ -121,6 +121,8 @@ def find_non_participants(
                 """,
                 (tag,),
             ).fetchone()
+            first_seen_seq = first_seen["seq"] if first_seen else 0
+            is_new_member  = first_seen_seq >= weekend_sequences[0]
             flagged.append({
                 "name":           name,
                 "tag":            tag,
@@ -134,7 +136,8 @@ def find_non_participants(
                 "excused":        excused,
                 "fame":           snap["fame"] if snap else 0,
                 "trophies":       m["trophies"],
-                "first_seen_seq": first_seen["seq"] if first_seen else 0,
+                "first_seen_seq": first_seen_seq,
+                "is_new_member":  is_new_member,
             })
 
     flagged.sort(key=lambda c: (c["decks_used"], c["fame"]))
@@ -217,7 +220,23 @@ def find_member_fame_stats(
 
     clan_avg_fame = round(sum(all_avg_fames) / len(all_avg_fames), 1) if all_avg_fames else 0.0
     stats.sort(key=lambda p: p["avg_fame"])
-    return stats, actual_days, clan_avg_fame
+
+    sorted_fames = sorted(all_avg_fames)
+    n = len(sorted_fames)
+    if n:
+        mid = n // 2
+        clan_median_fame = round(
+            sorted_fames[mid] if n % 2 else (sorted_fames[mid - 1] + sorted_fames[mid]) / 2, 1
+        )
+    else:
+        clan_median_fame = 0.0
+
+    clan_stats = {
+        "avg_fame":    clan_avg_fame,
+        "median_fame": clan_median_fame,
+        "members_tracked": n,
+    }
+    return stats, actual_days, clan_stats
 
 
 def _per_day_fame(conn, day_rows: list, tag: str) -> list[int]:
@@ -291,7 +310,7 @@ def _build_lines(
     worst_performers: list[dict],
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
-    clan_avg_fame: float = 0.0,
+    clan_stats: dict | None = None,
 ) -> list[str]:
     lines = [f"**Action Required — Section {section_label}**", ""]
 
@@ -301,7 +320,10 @@ def _build_lines(
         for action, group in _group_flagged(flagged):
             lines.append(f"**{action}**")
             for c in group:
-                new_note = f" *(joined day {c['excused']})*" if c['excused'] else ""
+                if c['excused']:
+                    new_note = f" *(joined day {c['excused']})*" if c['is_new_member'] else f" *(absent day 1-{c['excused']})*"
+                else:
+                    new_note = ""
                 lines.append(
                     f"• **{c['name']}** [{c['trophies']:,}] — "
                     f"{c['decks_used']}/{c['max_decks']} decks (last: {c['decks_today']}) | {c['fame']} fame{new_note}"
@@ -328,14 +350,17 @@ def _build_lines(
     if worst_performers:
         lines.append("")
         lines.append(f"**Worst Performers (last {worst_actual_days} war days)**")
-        if clan_avg_fame > 0:
-            lines.append(f"_Clan average: {clan_avg_fame:,.0f} fame/day_")
         for p in worst_performers:
             lines.append(
                 f"⚠️ **{p['name']}** [{p['trophies']:,}] — "
                 f"{p['avg_fame']:,} fame/day avg ({p['days_tracked']} days) "
                 f"→ {p['action']}"
             )
+
+    if clan_stats and clan_stats.get("members_tracked"):
+        lines.append("")
+        lines.append(f"**Clan Stats** (last {worst_actual_days} war days, {clan_stats['members_tracked']} members)")
+        lines.append(f"📊 Avg: {clan_stats['avg_fame']:,.0f} fame/day  |  Median: {clan_stats['median_fame']:,.0f} fame/day")
 
     return lines
 
@@ -369,7 +394,7 @@ def send_discord(
     worst_performers: list[dict],
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
-    clan_avg_fame: float = 0.0,
+    clan_stats: dict | None = None,
 ) -> None:
     if not DISCORD_WEBHOOK:
         print("DISCORD_WEBHOOK not set — skipping Discord send")
@@ -378,7 +403,7 @@ def send_discord(
     env_label = "PROD" if _env == "production" else "DEV"
     print(f"Sending to Discord ({env_label})...")
 
-    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_avg_fame))
+    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats))
     for chunk in _split_content(content):
         resp = requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
         resp.raise_for_status()
@@ -397,9 +422,9 @@ def print_report(
     worst_performers: list[dict],
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
-    clan_avg_fame: float = 0.0,
+    clan_stats: dict | None = None,
 ) -> None:
-    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_avg_fame)))
+    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats)))
     print()
 
 
@@ -479,7 +504,7 @@ def main() -> None:
     trophies_by_tag       = {m["player_tag"].upper(): m["trophies"] for m in members}
     flagged               = find_non_participants(conn, period_index, period_type, section_index, snapshots, members)
     top_performers        = find_top_performers(snapshots, trophies_by_tag)
-    worst_stats, worst_actual_days, clan_avg_fame = find_member_fame_stats(
+    worst_stats, worst_actual_days, clan_stats = find_member_fame_stats(
         conn, period_index, period_type, section_index, num_days=args.worst_days, members=members
     )
     worst_performers = worst_stats[:args.worst_show]
@@ -494,10 +519,10 @@ def main() -> None:
 
     promotion_candidates = best_stats[:args.best_show]
 
-    print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_avg_fame=clan_avg_fame)
+    print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats)
 
     if not args.dry_run:
-        send_discord(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_avg_fame=clan_avg_fame)
+        send_discord(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats)
 
     conn.close()
 
