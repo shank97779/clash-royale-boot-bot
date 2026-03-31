@@ -26,10 +26,13 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 CLAN_TAG     = os.getenv("CLAN_TAG", "#PJ8Q8P")
 DB_PATH      = os.getenv("DB_PATH",  db.DB_PATH)
-MIN_DECKS         = int(os.getenv("MIN_DECKS_PER_DAY",   "4"))
-MAX_DECKS_PER_DAY = 4  # Clash Royale war day maximum — not configurable
-PROMOTE_FAME      = int(os.getenv("PROMOTE_FAME",        "2000"))
-PROMOTE_WAR_COUNT = int(os.getenv("PROMOTE_WAR_COUNT",   "3"))
+MIN_DECKS_PER_DAY       = int(os.getenv("MIN_DECKS_PER_DAY",           "4"))
+MAX_DECKS_PER_DAY       = 4  # Clash Royale war day maximum — not configurable
+PROMOTE_FAME_PER_DAY    = int(os.getenv("PROMOTE_FAME_PER_DAY",          "500"))
+WORST_PERFORMERS_DAYS   = int(os.getenv("WORST_PERFORMERS_DAYS",         "16"))
+WORST_PERFORMERS_SHOW   = int(os.getenv("WORST_PERFORMERS_SHOW",           "5"))
+BEST_PERFORMERS_DAYS    = int(os.getenv("BEST_PERFORMERS_DAYS",          "16"))
+BEST_PERFORMERS_SHOW    = int(os.getenv("BEST_PERFORMERS_SHOW",            "5"))
 
 _env = os.getenv("ENVIRONMENT", "").strip().lower()
 if _env == "production":
@@ -40,7 +43,7 @@ else:
 # Comma-separated player tags that are never flagged (#ABC123,#DEF456).
 EXEMPT_TAGS: set[str] = {
     t.strip().upper()
-    for t in os.getenv("EXEMPT_MEMBERS", "").split(",")
+    for t in os.getenv("EXEMPT_TAGS", "").split(",")
     if t.strip()
 }
 
@@ -60,12 +63,14 @@ def find_non_participants(
     period_index: int,
     period_type: str,
     section_index: int,
+    snapshots: list,
+    members: list,
 ) -> list[dict]:
     """
     Returns members who haven't used enough decks across the war weekend.
 
     Evaluation is cumulative over the whole weekend, not per-day:
-      required = (completed_war_days - days_excused) * MIN_DECKS
+      required = (completed_war_days - days_excused) * MIN_DECKS_PER_DAY
       flag if decks_used < required
 
     days_excused = number of war day sections where the player wasn't in the
@@ -74,14 +79,9 @@ def find_non_participants(
 
     Exempt tags are always skipped.
     """
-    snapshots = db.get_snapshot(conn, period_index, period_type, section_index)
-    if not snapshots:
+    if not snapshots or snapshots[0]["period_type"] != "warDay":
         return []
 
-    if snapshots[0]["period_type"] != "warDay":
-        return []
-
-    members     = db.get_members(conn, period_index, period_type, section_index)
     snap_by_tag = {row["player_tag"]: row for row in snapshots}
 
     weekend_sections  = db.war_weekend_sections(conn, period_index, period_type, section_index)
@@ -98,7 +98,7 @@ def find_non_participants(
 
         excused   = db.days_excused(conn, tag, weekend_sequences)
         owed      = completed_days - excused
-        required  = owed * MIN_DECKS
+        required  = owed * MIN_DECKS_PER_DAY
         max_decks = owed * MAX_DECKS_PER_DAY
 
         if required <= 0:
@@ -143,67 +143,100 @@ def find_non_participants(
 
 
 
-def find_promotion_candidates(
+def find_member_fame_stats(
     conn,
     period_index: int,
     period_type: str,
     section_index: int,
-) -> list[dict]:
+    num_days: int = WORST_PERFORMERS_DAYS,
+    members: list | None = None,
+) -> tuple[list[dict], int, float]:
     """
-    Returns 'member'-role players who earned >= PROMOTE_FAME fame
-    in each of the last PROMOTE_WAR_COUNT completed warDay sections.
+    Compute per-day average fame over the last num_days warDay sections for
+    every current non-exempt member who has snapshot data.
+
+    Returns (stats, actual_days, clan_avg_fame) where:
+      - stats           : all qualifying members sorted worst-first (asc avg_fame)
+      - actual_days     : warDay sections actually found (may be < num_days)
+      - clan_avg_fame   : mean fame/day across ALL members (incl. exempt) for context
+
+    Callers slice the list for their purpose:
+      worst N  : stats[:n]                  (exclude already-flagged tags first)
+      best  N  : reversed(stats)[:n]        (filter to role=='member' and threshold)
+
+    Per-day fame diffs cumulative values within a war weekend; the first day
+    of each new weekend uses its value directly (fame resets each war).
     """
-    current = conn.execute(
+    target = conn.execute(
         "SELECT sequence FROM sections WHERE period_index=? AND period_type=? AND section_index=?",
         (period_index, period_type, section_index),
     ).fetchone()
-    if current is None:
-        return []
+    if target is None:
+        return [], 0, 0.0
 
-    recent = conn.execute(
+    day_rows = conn.execute(
         """
-        SELECT sequence FROM sections
+        SELECT period_index, period_type, section_index, sequence
+        FROM sections
         WHERE period_type = 'warDay' AND sequence <= ?
         ORDER BY sequence DESC
         LIMIT ?
         """,
-        (current["sequence"], PROMOTE_WAR_COUNT),
+        (target["sequence"], num_days),
     ).fetchall()
+    if not day_rows:
+        return [], 0, 0.0
 
-    if len(recent) < PROMOTE_WAR_COUNT:
-        return []  # Not enough history yet
+    day_rows    = list(reversed(day_rows))  # oldest-first
+    actual_days = len(day_rows)
 
-    sequences = [r["sequence"] for r in recent]
-    placeholders = ",".join("?" * len(sequences))
+    if members is None:
+        members = db.get_members(conn, period_index, period_type, section_index)
 
-    qualifying = conn.execute(
-        f"""
-        SELECT ss.player_tag
-        FROM section_snapshots ss
-        JOIN sections s
-          ON s.period_index  = ss.period_index
-         AND s.period_type   = ss.period_type
-         AND s.section_index = ss.section_index
-        WHERE s.sequence IN ({placeholders})
-          AND ss.fame >= ?
-        GROUP BY ss.player_tag
-        HAVING COUNT(DISTINCT s.sequence) = ?
-        """,
-        (*sequences, PROMOTE_FAME, PROMOTE_WAR_COUNT),
-    ).fetchall()
-    qualifying_tags = {r["player_tag"] for r in qualifying}
+    stats: list[dict] = []
+    all_avg_fames: list[float] = []
 
-    members = db.get_members(conn, period_index, period_type, section_index)
-    candidates = [
-        {"name": m["player_name"], "tag": m["player_tag"]}
-        for m in members
-        if m["player_tag"] in qualifying_tags and m["role"] == "member"
-    ]
-    candidates.sort(key=lambda c: c["name"].lower())
-    return candidates
+    for m in members:
+        tag      = m["player_tag"]
+        name     = m["player_name"]
+        daily    = _per_day_fame(conn, day_rows, tag)
+        if not daily:
+            continue
+        avg_fame = sum(daily) / len(daily)
+        all_avg_fames.append(avg_fame)
+        if tag.upper() in EXEMPT_TAGS:
+            continue
+        stats.append({
+            "name":         name,
+            "tag":          tag,
+            "role":         m["role"],
+            "action":       ROLE_ACTIONS.get(m["role"], "Boot"),
+            "days_tracked": len(daily),
+            "avg_fame":     round(avg_fame),
+            "trophies":     m["trophies"],
+        })
+
+    clan_avg_fame = round(sum(all_avg_fames) / len(all_avg_fames), 1) if all_avg_fames else 0.0
+    stats.sort(key=lambda p: p["avg_fame"])
+    return stats, actual_days, clan_avg_fame
 
 
-def find_top_performers(snapshots: list) -> list[list[dict]]:
+def _per_day_fame(conn, day_rows: list, tag: str) -> list[int]:
+    """Return per-day fame values (oldest-first) for `tag` across `day_rows`."""
+    daily: list[int] = []
+    for r in day_rows:
+        snap = conn.execute(
+            "SELECT fame_today FROM section_snapshots"
+            " WHERE period_index=? AND period_type=? AND section_index=? AND player_tag=?",
+            (r["period_index"], r["period_type"], r["section_index"], tag),
+        ).fetchone()
+        if snap is None or snap["fame_today"] is None:
+            continue
+        daily.append(snap["fame_today"])
+    return daily
+
+
+def find_top_performers(snapshots: list, trophies_by_tag: dict | None = None) -> list[list[dict]]:
     """
     Returns up to three podium tiers (1st, 2nd, 3rd) by fame.
     Each tier is a list of player dicts — ties at the same fame level share a rank.
@@ -224,7 +257,12 @@ def find_top_performers(snapshots: list) -> list[list[dict]]:
                 break
             tiers.append([])
             seen_fame.add(fame)
-        tiers[-1].append({"name": snap["player_name"], "tag": snap["player_tag"], "fame": fame})
+        tiers[-1].append({
+                "name":    snap["player_name"],
+                "tag":     snap["player_tag"],
+                "fame":    fame,
+                "trophies": (trophies_by_tag or {}).get(snap["player_tag"].upper(), 0),
+            })
 
     return tiers
 
@@ -251,6 +289,10 @@ def _build_lines(
     flagged: list[dict],
     top_performers: list[list[dict]],
     promotion_candidates: list[dict],
+    worst_performers: list[dict],
+    worst_actual_days: int = WORST_PERFORMERS_DAYS,
+    promo_actual_days: int = WORST_PERFORMERS_DAYS,
+    clan_avg_fame: float = 0.0,
 ) -> list[str]:
     lines = [f"**Action Required — Section {section_label}**", ""]
 
@@ -267,20 +309,33 @@ def _build_lines(
                 )
             lines.append("")
 
-    if promotion_candidates:
-        lines.append("")
-        lines.append(f"**Promote to Elder** ({PROMOTE_WAR_COUNT} wars ≥ {PROMOTE_FAME} fame)")
-        for c in promotion_candidates:
-            lines.append(f"⬆️ **{c['name']}** ({c['tag']})")
-
     if top_performers:
-        lines.append("")
-        lines.append("**Top Performers**")
+        lines.append("**Current War MVPs**")
         for i, tier in enumerate(top_performers):
             medal = PODIUM_MEDALS[i]
-            names = ", ".join(f"**{p['name']}**" for p in tier)
+            names = ", ".join(f"**{p['name']}** [{p['trophies']:,}]" for p in tier)
             fame  = tier[0]["fame"]
             lines.append(f"{medal} {names} — {fame} fame")
+
+    lines.append("")
+    lines.append(f"**Best Performers** (≥ {PROMOTE_FAME_PER_DAY} fame/day avg, last {promo_actual_days} days)")
+    if promotion_candidates:
+        for c in promotion_candidates:
+            lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}] — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days)")
+    else:
+        lines.append("No promotion candidates.")
+
+    if worst_performers:
+        lines.append("")
+        lines.append(f"**Worst Performers (last {worst_actual_days} war days)**")
+        if clan_avg_fame > 0:
+            lines.append(f"_Clan average: {clan_avg_fame:,.0f} fame/day_")
+        for p in worst_performers:
+            lines.append(
+                f"⚠️ **{p['name']}** [{p['trophies']:,}] — "
+                f"{p['avg_fame']:,} fame/day avg ({p['days_tracked']} days) "
+                f"→ {p['action']}"
+            )
 
     return lines
 
@@ -311,6 +366,10 @@ def send_discord(
     flagged: list[dict],
     top_performers: list[list[dict]],
     promotion_candidates: list[dict],
+    worst_performers: list[dict],
+    worst_actual_days: int = WORST_PERFORMERS_DAYS,
+    promo_actual_days: int = WORST_PERFORMERS_DAYS,
+    clan_avg_fame: float = 0.0,
 ) -> None:
     if not DISCORD_WEBHOOK:
         print("DISCORD_WEBHOOK not set — skipping Discord send")
@@ -319,7 +378,7 @@ def send_discord(
     env_label = "PROD" if _env == "production" else "DEV"
     print(f"Sending to Discord ({env_label})...")
 
-    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates))
+    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_avg_fame))
     for chunk in _split_content(content):
         resp = requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
         resp.raise_for_status()
@@ -335,8 +394,12 @@ def print_report(
     flagged: list[dict],
     top_performers: list[list[dict]],
     promotion_candidates: list[dict],
+    worst_performers: list[dict],
+    worst_actual_days: int = WORST_PERFORMERS_DAYS,
+    promo_actual_days: int = WORST_PERFORMERS_DAYS,
+    clan_avg_fame: float = 0.0,
 ) -> None:
-    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates)))
+    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_avg_fame)))
     print()
 
 
@@ -357,7 +420,36 @@ def main() -> None:
         help="Section to report as '<period_index>:<period_type>:<section_index>'. Defaults to the latest completed war section.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print report but do not send to Discord.")
+    parser.add_argument(
+        "--worst-days",
+        type=int,
+        default=WORST_PERFORMERS_DAYS,
+        metavar="N",
+        help=f"Rolling war day window for worst performers (default: {WORST_PERFORMERS_DAYS}).",
+    )
+    parser.add_argument(
+        "--worst-show",
+        type=int,
+        default=WORST_PERFORMERS_SHOW,
+        metavar="N",
+        help=f"Number of worst performers to show (default: {WORST_PERFORMERS_SHOW}).",
+    )
+    parser.add_argument(
+        "--best-days",
+        type=int,
+        default=BEST_PERFORMERS_DAYS,
+        metavar="N",
+        help=f"Rolling war day window for promotion candidates (default: {BEST_PERFORMERS_DAYS}).",
+    )
+    parser.add_argument(
+        "--best-show",
+        type=int,
+        default=BEST_PERFORMERS_SHOW,
+        metavar="N",
+        help=f"Number of promotion candidates to show (default: {BEST_PERFORMERS_SHOW}).",
+    )
     args = parser.parse_args()
+    best_days = args.best_days
 
     conn = db.get_db(DB_PATH)
     db.init_db(conn)
@@ -383,14 +475,32 @@ def main() -> None:
         conn.close()
         sys.exit(1)
 
-    flagged               = find_non_participants(conn, period_index, period_type, section_index)
-    top_performers        = find_top_performers(snapshots)
-    promotion_candidates  = find_promotion_candidates(conn, period_index, period_type, section_index)
+    members               = db.get_members(conn, period_index, period_type, section_index)
+    trophies_by_tag       = {m["player_tag"].upper(): m["trophies"] for m in members}
+    flagged               = find_non_participants(conn, period_index, period_type, section_index, snapshots, members)
+    top_performers        = find_top_performers(snapshots, trophies_by_tag)
+    worst_stats, worst_actual_days, clan_avg_fame = find_member_fame_stats(
+        conn, period_index, period_type, section_index, num_days=args.worst_days, members=members
+    )
+    worst_performers = worst_stats[:args.worst_show]
 
-    print_report(section_label, flagged, top_performers, promotion_candidates)
+    if best_days == args.worst_days:
+        best_stats, promo_actual_days = list(reversed(worst_stats)), worst_actual_days
+    else:
+        full_best, promo_actual_days, _ = find_member_fame_stats(
+            conn, period_index, period_type, section_index, num_days=best_days, members=members
+        )
+        best_stats = list(reversed(full_best))
+
+    promotion_candidates = [
+        p for p in best_stats
+        if p["avg_fame"] >= PROMOTE_FAME_PER_DAY
+    ][:args.best_show]
+
+    print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_avg_fame=clan_avg_fame)
 
     if not args.dry_run:
-        send_discord(section_label, flagged, top_performers, promotion_candidates)
+        send_discord(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_avg_fame=clan_avg_fame)
 
     conn.close()
 
