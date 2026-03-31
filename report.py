@@ -28,11 +28,10 @@ CLAN_TAG     = os.getenv("CLAN_TAG", "#PJ8Q8P")
 DB_PATH      = os.getenv("DB_PATH",  db.DB_PATH)
 MIN_DECKS_PER_DAY       = int(os.getenv("MIN_DECKS_PER_DAY",           "4"))
 MAX_DECKS_PER_DAY       = 4  # Clash Royale war day maximum — not configurable
-PROMOTE_FAME_PER_DAY    = int(os.getenv("PROMOTE_FAME_PER_DAY",          "500"))
 WORST_PERFORMERS_DAYS   = int(os.getenv("WORST_PERFORMERS_DAYS",         "16"))
-WORST_PERFORMERS_SHOW   = int(os.getenv("WORST_PERFORMERS_SHOW",           "5"))
+WORST_PERFORMERS_SHOW   = int(os.getenv("WORST_PERFORMERS_SHOW",           "10"))
 BEST_PERFORMERS_DAYS    = int(os.getenv("BEST_PERFORMERS_DAYS",          "16"))
-BEST_PERFORMERS_SHOW    = int(os.getenv("BEST_PERFORMERS_SHOW",            "5"))
+BEST_PERFORMERS_SHOW    = int(os.getenv("BEST_PERFORMERS_SHOW",            "10"))
 
 _env = os.getenv("ENVIRONMENT", "").strip().lower()
 if _env == "production":
@@ -305,7 +304,7 @@ def _build_lines(
                 new_note = f" *(joined day {c['excused']})*" if c['excused'] else ""
                 lines.append(
                     f"• **{c['name']}** [{c['trophies']:,}] — "
-                    f"{c['decks_used']}/{c['max_decks']} decks (yest: {c['decks_today']}) | {c['fame']} fame{new_note}"
+                    f"{c['decks_used']}/{c['max_decks']} decks (last: {c['decks_today']}) | {c['fame']} fame{new_note}"
                 )
             lines.append("")
 
@@ -318,10 +317,11 @@ def _build_lines(
             lines.append(f"{medal} {names} — {fame} fame")
 
     lines.append("")
-    lines.append(f"**Best Performers** (≥ {PROMOTE_FAME_PER_DAY} fame/day avg, last {promo_actual_days} days)")
+    lines.append(f"**Best Performers** (last {promo_actual_days} days)")
     if promotion_candidates:
         for c in promotion_candidates:
-            lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}] — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days)")
+            action = " → Promote to Elder" if c["role"] == "member" else ""
+            lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}] — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days){action}")
     else:
         lines.append("No promotion candidates.")
 
@@ -492,10 +492,7 @@ def main() -> None:
         )
         best_stats = list(reversed(full_best))
 
-    promotion_candidates = [
-        p for p in best_stats
-        if p["avg_fame"] >= PROMOTE_FAME_PER_DAY
-    ][:args.best_show]
+    promotion_candidates = best_stats[:args.best_show]
 
     print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_avg_fame=clan_avg_fame)
 
