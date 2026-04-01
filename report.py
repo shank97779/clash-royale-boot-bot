@@ -349,7 +349,7 @@ def _build_lines(
 
     if worst_performers:
         lines.append("")
-        lines.append(f"**Worst Performers (last {worst_actual_days} war days)**")
+        lines.append(f"**Worst Performers** (last {worst_actual_days} war days)")
         for p in worst_performers:
             lines.append(
                 f"⚠️ **{p['name']}** [{p['trophies']:,}] — "
@@ -359,7 +359,7 @@ def _build_lines(
 
     if clan_stats and clan_stats.get("members_tracked"):
         lines.append("")
-        lines.append(f"**Clan Stats** (last {worst_actual_days} war days, {clan_stats['members_tracked']} members)")
+        lines.append(f"**Clan Stats** (last {worst_actual_days} war days, {clan_stats['members_tracked']} members tracked)")
         lines.append(f"📊 Avg: {clan_stats['avg_fame']:,.0f} fame/day  |  Median: {clan_stats['median_fame']:,.0f} fame/day")
 
     return lines
