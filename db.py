@@ -270,21 +270,29 @@ def latest_section(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def latest_completed_war_section(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """
+    Return the section immediately before the current latest ONLY if it is a
+    warDay section.  This ensures the daily cron report fires once on the day
+    after a war day and is silent on all other days.
+    """
     latest = latest_section(conn)
     if latest is None:
         return None
 
-    return conn.execute(
+    prev = conn.execute(
         """
         SELECT period_index, period_type, section_index, sequence, first_seen_at
         FROM sections
-        WHERE period_type = 'warDay'
-          AND sequence < ?
+        WHERE sequence < ?
         ORDER BY sequence DESC
         LIMIT 1
         """,
         (latest["sequence"],),
     ).fetchone()
+
+    if prev is None or prev["period_type"] != "warDay":
+        return None
+    return prev
 
 
 def war_weekend_sections(
