@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from datetime import datetime
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 
@@ -38,6 +39,24 @@ DB_PATH = os.getenv("DB_PATH", "boot-bot.db")
 # Section types that count as war days (participation is evaluated on these).
 # 'colosseum' is the final war weekend of a season — treated identically to 'warDay'.
 WAR_DAY_TYPES = ("warDay", "colosseum")
+
+
+class SectionKey(NamedTuple):
+    season_index:  int
+    period_index:  int
+    period_type:   str
+    section_index: int
+
+    def __str__(self) -> str:
+        return f"{self.season_index}:{self.period_index}:{self.period_type}:{self.section_index}"
+
+    @classmethod
+    def parse(cls, value: str) -> "SectionKey":
+        parts = value.split(":", 3)
+        if len(parts) != 4:
+            raise ValueError("Section key must look like '<season_index>:<period_index>:<period_type>:<section_index>'")
+        si, pi, pt, sci = parts
+        return cls(int(si), int(pi), pt, int(sci))
 
 
 def get_db(path: str = DB_PATH) -> sqlite3.Connection:
@@ -162,16 +181,13 @@ def _prev_warday_fame(
 
 
 def section_key(season_index: int, period_index: int, period_type: str, section_index: int) -> str:
-    return f"{season_index}:{period_index}:{period_type}:{section_index}"
+    """Compatibility shim — prefer SectionKey directly."""
+    return str(SectionKey(season_index, period_index, period_type, section_index))
 
 
 def parse_section_key(value: str) -> tuple[int, int, str, int]:
-    parts = value.split(":", 3)
-    if len(parts) != 4:
-        raise ValueError("Section key must look like '<season_index>:<period_index>:<period_type>:<section_index>'")
-
-    season_index_str, period_index_str, period_type, section_index_str = parts
-    return int(season_index_str), int(period_index_str), period_type, int(section_index_str)
+    """Compatibility shim — prefer SectionKey.parse() directly."""
+    return SectionKey.parse(value)
 
 
 def current_season(conn: sqlite3.Connection) -> int:
@@ -180,13 +196,25 @@ def current_season(conn: sqlite3.Connection) -> int:
     return int(row["s"])
 
 
+def resolve_season(conn: sqlite3.Connection, period_index: int) -> int:
+    """
+    Determine the correct season_index for an incoming period_index.
+    If the new period_index is less than the current maximum (and data exists),
+    the API has reset for a new season — bump the season counter.
+    """
+    cur = current_season(conn)
+    row = conn.execute(
+        "SELECT COALESCE(MAX(period_index), 0) AS m FROM sections WHERE season_index = ?",
+        (cur,),
+    ).fetchone()
+    max_pi = int(row["m"])
+    return cur + 1 if (period_index < max_pi and max_pi > 0) else cur
+
+
 def ensure_section(
     conn: sqlite3.Connection,
     now_utc: datetime,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: SectionKey,
 ) -> None:
     existing = conn.execute(
         """
@@ -195,7 +223,7 @@ def ensure_section(
         WHERE season_index = ? AND period_index = ? AND period_type = ? AND section_index = ?
         LIMIT 1
         """,
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchone()
     if existing:
         return
@@ -208,7 +236,7 @@ def ensure_section(
             (season_index, period_index, period_type, section_index, sequence, first_seen_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (season_index, period_index, period_type, section_index, next_sequence, now_utc.isoformat()),
+        (*section, next_sequence, now_utc.isoformat()),
     )
 
 
@@ -251,10 +279,7 @@ def latest_completed_war_section(conn: sqlite3.Connection) -> sqlite3.Row | None
 
 def war_weekend_sections(
     conn: sqlite3.Connection,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: SectionKey,
 ) -> list[sqlite3.Row]:
     """
     Return all warDay sections in the same war weekend as the given section,
@@ -266,7 +291,7 @@ def war_weekend_sections(
     """
     target = conn.execute(
         "SELECT sequence FROM sections WHERE season_index=? AND period_index=? AND period_type=? AND section_index=?",
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchone()
     if target is None:
         return []
@@ -285,7 +310,7 @@ def war_weekend_sections(
 
     return conn.execute(
         """
-        SELECT period_index, period_type, section_index, sequence, first_seen_at
+        SELECT season_index, period_index, period_type, section_index, sequence, first_seen_at
         FROM sections
         WHERE period_type IN ('warDay', 'colosseum')
           AND sequence >  ?
@@ -348,25 +373,22 @@ def days_excused(
 def store_race_snapshot(
     conn: sqlite3.Connection,
     pulled_at: datetime,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: SectionKey,
     participants: list,
 ) -> None:
     """Upsert participant stats for a section, computing fame_today at store time."""
-    ensure_section(conn, pulled_at, season_index, period_index, period_type, section_index)
+    ensure_section(conn, pulled_at, section)
 
     current_seq = conn.execute(
         "SELECT sequence FROM sections WHERE season_index=? AND period_index=? AND period_type=? AND section_index=?",
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchone()["sequence"]
 
     for participant in participants:
         tag   = participant["tag"]
         fame  = participant.get("fame", 0)
 
-        if period_type in WAR_DAY_TYPES:
+        if section.period_type in WAR_DAY_TYPES:
             prev_fame  = _prev_warday_fame(conn, current_seq, tag)
             fame_today = max(0, fame - prev_fame) if prev_fame is not None else fame
         else:
@@ -390,10 +412,7 @@ def store_race_snapshot(
                 pulled_at        = excluded.pulled_at
             """,
             (
-                season_index,
-                period_index,
-                period_type,
-                section_index,
+                *section,
                 tag,
                 participant["name"],
                 fame,
@@ -411,20 +430,17 @@ def store_race_snapshot(
 def store_member_snapshot(
     conn: sqlite3.Connection,
     pulled_at: datetime,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: SectionKey,
     members: list,
 ) -> None:
     """Replace the roster for the section with the latest raw member payload."""
-    ensure_section(conn, pulled_at, season_index, period_index, period_type, section_index)
+    ensure_section(conn, pulled_at, section)
     conn.execute(
         """
         DELETE FROM section_members
         WHERE season_index = ? AND period_index = ? AND period_type = ? AND section_index = ?
         """,
-        (season_index, period_index, period_type, section_index),
+        section,
     )
     for member in members:
         conn.execute(
@@ -435,10 +451,7 @@ def store_member_snapshot(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                season_index,
-                period_index,
-                period_type,
-                section_index,
+                *section,
                 member["tag"],
                 member["name"],
                 member.get("role", "member"),
@@ -452,13 +465,7 @@ def store_member_snapshot(
     conn.commit()
 
 
-def get_snapshot(
-    conn: sqlite3.Connection,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
-) -> list:
+def get_snapshot(conn: sqlite3.Connection, section: SectionKey) -> list:
     return conn.execute(
         """
         SELECT *
@@ -466,17 +473,11 @@ def get_snapshot(
         WHERE season_index = ? AND period_index = ? AND period_type = ? AND section_index = ?
         ORDER BY player_name, player_tag
         """,
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchall()
 
 
-def get_members(
-    conn: sqlite3.Connection,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
-) -> list:
+def get_members(conn: sqlite3.Connection, section: SectionKey) -> list:
     return conn.execute(
         """
         SELECT *
@@ -484,7 +485,7 @@ def get_members(
         WHERE season_index = ? AND period_index = ? AND period_type = ? AND section_index = ?
         ORDER BY player_name, player_tag
         """,
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchall()
 
 

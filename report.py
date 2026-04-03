@@ -60,10 +60,7 @@ ROLE_ACTIONS = {
 
 def find_non_participants(
     conn,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: db.SectionKey,
     snapshots: list,
     members: list,
 ) -> list[dict]:
@@ -80,12 +77,12 @@ def find_non_participants(
 
     Exempt tags are always skipped.
     """
-    if not snapshots or snapshots[0]["period_type"] not in ("warDay", "colosseum"):
+    if not snapshots or snapshots[0]["period_type"] not in db.WAR_DAY_TYPES:
         return []
 
     snap_by_tag = {row["player_tag"]: row for row in snapshots}
 
-    weekend_sections  = db.war_weekend_sections(conn, season_index, period_index, period_type, section_index)
+    weekend_sections  = db.war_weekend_sections(conn, section)
     weekend_sequences = [s["sequence"] for s in weekend_sections]
     completed_days    = len(weekend_sections)
 
@@ -116,8 +113,9 @@ def find_non_participants(
                 SELECT MIN(s.sequence) AS seq
                 FROM section_snapshots ss
                 JOIN sections s
-                  ON s.period_index = ss.period_index
-                 AND s.period_type  = ss.period_type
+                  ON s.season_index  = ss.season_index
+                 AND s.period_index  = ss.period_index
+                 AND s.period_type   = ss.period_type
                  AND s.section_index = ss.section_index
                 WHERE ss.player_tag = ?
                 """,
@@ -149,10 +147,7 @@ def find_non_participants(
 
 def find_member_fame_stats(
     conn,
-    season_index: int,
-    period_index: int,
-    period_type: str,
-    section_index: int,
+    section: db.SectionKey,
     num_days: int = WORST_PERFORMERS_DAYS,
     members: list | None = None,
 ) -> tuple[list[dict], int, float]:
@@ -174,7 +169,7 @@ def find_member_fame_stats(
     """
     target = conn.execute(
         "SELECT sequence FROM sections WHERE season_index=? AND period_index=? AND period_type=? AND section_index=?",
-        (season_index, period_index, period_type, section_index),
+        section,
     ).fetchone()
     if target is None:
         return [], 0, 0.0
@@ -196,7 +191,7 @@ def find_member_fame_stats(
     actual_days = len(day_rows)
 
     if members is None:
-        members = db.get_members(conn, season_index, period_index, period_type, section_index)
+        members = db.get_members(conn, section)
 
     stats: list[dict] = []
     all_avg_fames: list[float] = []
@@ -431,9 +426,9 @@ def print_report(
     print()
 
 
-def parse_section_arg(value: str) -> tuple[int, int, str, int]:
+def parse_section_arg(value: str) -> db.SectionKey:
     try:
-        return db.parse_section_key(value)
+        return db.SectionKey.parse(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -484,13 +479,13 @@ def main() -> None:
 
     # Choose which section to report.
     if args.section:
-        season_index, period_index, period_type, section_index = args.section
+        section = args.section
         row = conn.execute(
             "SELECT 1 FROM sections WHERE season_index=? AND period_index=? AND period_type=? AND section_index=?",
-            (season_index, period_index, period_type, section_index),
+            section,
         ).fetchone()
         if row is None:
-            print(f"Section {db.section_key(season_index, period_index, period_type, section_index)} not found in DB.")
+            print(f"Section {section} not found in DB.")
             conn.close()
             sys.exit(1)
     else:
@@ -499,25 +494,27 @@ def main() -> None:
             print("No warDay data found for day before.")
             conn.close()
             sys.exit(0)
-        season_index        = latest_section["season_index"]
-        period_index  = latest_section["period_index"]
-        period_type   = latest_section["period_type"]
-        section_index = latest_section["section_index"]
+        section = db.SectionKey(
+            latest_section["season_index"],
+            latest_section["period_index"],
+            latest_section["period_type"],
+            latest_section["section_index"],
+        )
 
-    section_label = db.section_key(season_index, period_index, period_type, section_index)
+    section_label = str(section)
 
-    snapshots = db.get_snapshot(conn, season_index, period_index, period_type, section_index)
+    snapshots = db.get_snapshot(conn, section)
     if not snapshots:
         print(f"No snapshot data found for {section_label}. Run ingest.py first.")
         conn.close()
         sys.exit(1)
 
-    members               = db.get_members(conn, season_index, period_index, period_type, section_index)
+    members               = db.get_members(conn, section)
     trophies_by_tag       = {m["player_tag"].upper(): m["trophies"] for m in members}
-    flagged               = find_non_participants(conn, season_index, period_index, period_type, section_index, snapshots, members)
+    flagged               = find_non_participants(conn, section, snapshots, members)
     top_performers        = find_top_performers(snapshots, trophies_by_tag)
     worst_stats, worst_actual_days, clan_stats = find_member_fame_stats(
-        conn, season_index, period_index, period_type, section_index, num_days=args.worst_days, members=members
+        conn, section, num_days=args.worst_days, members=members
     )
     worst_performers = worst_stats[:args.worst_show]
 
@@ -525,7 +522,7 @@ def main() -> None:
         best_stats, promo_actual_days = list(reversed(worst_stats)), worst_actual_days
     else:
         full_best, promo_actual_days, _ = find_member_fame_stats(
-            conn, season_index, period_index, period_type, section_index, num_days=best_days, members=members
+            conn, section, num_days=best_days, members=members
         )
         best_stats = list(reversed(full_best))
 
