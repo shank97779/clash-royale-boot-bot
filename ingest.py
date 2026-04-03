@@ -114,6 +114,7 @@ def log_member_stats(members: list, participants: list, section_key: str) -> Non
 
 def save_archive(
     ts: datetime,
+    season_index: int,
     period_index: int,
     period_type: str,
     section_index: int,
@@ -128,7 +129,8 @@ def save_archive(
         json.dump(
             {
                 "capturedAt": ts.isoformat(),
-                "sectionKey": db.section_key(period_index, period_type, section_index),
+                "sectionKey": db.section_key(season_index, period_index, period_type, section_index),
+                "seasonIndex": season_index,
                 "periodIndex": period_index,
                 "periodType": period_type,
                 "sectionIndex": section_index,
@@ -165,24 +167,32 @@ def main() -> None:
     section_index = race_data.get("sectionIndex", 0)
     clan_name     = clan_info.get("name", CLAN_TAG)
 
+    conn = db.get_db(DB_PATH)
+    db.init_db(conn)
+
+    # Detect season_index rollover: if the new period_index is less than the current
+    # maximum period_index stored, the API has reset for a new season.
+    cur_season    = db.current_season(conn)
+    max_pi_row    = conn.execute("SELECT COALESCE(MAX(period_index), 0) AS m FROM sections WHERE season_index = ?", (cur_season,)).fetchone()
+    max_pi        = int(max_pi_row["m"])
+    season_index  = cur_season + 1 if (period_index < max_pi and max_pi > 0) else cur_season
+
     log(
         f"[ingest] {clan_name} | members={len(members)} | "
-        f"participants={len(participants)} | period_index={period_index} "
+        f"participants={len(participants)} | season_index={season_index} | period_index={period_index} "
         f"period={period_type} section={section_index}",
     )
 
-    conn = db.get_db(DB_PATH)
-    db.init_db(conn)
-    db.ensure_section(conn, now_utc, period_index, period_type, section_index)
-    current_section_key = db.section_key(period_index, period_type, section_index)
+    db.ensure_section(conn, now_utc, season_index, period_index, period_type, section_index)
+    current_section_key = db.section_key(season_index, period_index, period_type, section_index)
 
-    archive_path = save_archive(now_utc, period_index, period_type, section_index, race_data, members)
+    archive_path = save_archive(now_utc, season_index, period_index, period_type, section_index, race_data, members)
     log(f"[ingest] section={current_section_key}")
     log(f"[ingest] saved {archive_path}")
     log_member_stats(members, participants, current_section_key)
 
-    db.store_race_snapshot(conn, now_utc, period_index, period_type, section_index, participants)
-    db.store_member_snapshot(conn, now_utc, period_index, period_type, section_index, members)
+    db.store_race_snapshot(conn, now_utc, season_index, period_index, period_type, section_index, participants)
+    db.store_member_snapshot(conn, now_utc, season_index, period_index, period_type, section_index, members)
     conn.close()
 
     log(f"[ingest] snapshots stored in {DB_PATH}")

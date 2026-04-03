@@ -7,7 +7,7 @@ from pathlib import Path
 
 import db
 import ingest
-from report import EXEMPT_TAGS, MIN_DECKS, find_non_participants, find_top_performers
+from report import EXEMPT_TAGS, MIN_DECKS_PER_DAY, find_non_participants, find_top_performers
 
 
 def make_conn() -> sqlite3.Connection:
@@ -21,6 +21,7 @@ def store_section(
     conn,
     *,
     seen_at: datetime,
+    season_index: int = 1,
     period_index: int,
     period_type: str,
     section_index: int,
@@ -30,6 +31,7 @@ def store_section(
     db.store_race_snapshot(
         conn,
         seen_at,
+        season_index,
         period_index,
         period_type,
         section_index,
@@ -38,6 +40,7 @@ def store_section(
     db.store_member_snapshot(
         conn,
         seen_at,
+        season_index,
         period_index,
         period_type,
         section_index,
@@ -47,9 +50,9 @@ def store_section(
 
 class TestSectionKeys:
     def test_section_key_round_trip(self):
-        key = db.section_key(25, "warDay", 3)
-        assert key == "25:warDay:3"
-        assert db.parse_section_key(key) == (25, "warDay", 3)
+        key = db.section_key(1, 25, "warDay", 3)
+        assert key == "1:25:warDay:3"
+        assert db.parse_section_key(key) == (1, 25, "warDay", 3)
 
 
 class TestInitDb:
@@ -71,9 +74,9 @@ class TestSections:
         conn = make_conn()
         now = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
 
-        db.ensure_section(conn, now, 25, "warDay", 0)
-        db.ensure_section(conn, now, 25, "warDay", 0)
-        db.ensure_section(conn, now, 25, "warDay", 1)
+        db.ensure_section(conn, now, 1, 25, "warDay", 0)
+        db.ensure_section(conn, now, 1, 25, "warDay", 0)
+        db.ensure_section(conn, now, 1, 25, "warDay", 1)
 
         rows = conn.execute(
             "SELECT period_index, period_type, section_index, sequence FROM sections ORDER BY sequence"
@@ -85,21 +88,21 @@ class TestSections:
 
     def test_latest_completed_war_section_excludes_current_section(self):
         conn = make_conn()
-        db.ensure_section(conn, datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc), 25, "warDay", 0)
-        db.ensure_section(conn, datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc), 25, "warDay", 1)
-        db.ensure_section(conn, datetime(2026, 3, 17, 10, 0, tzinfo=timezone.utc), 25, "warDay", 2)
+        db.ensure_section(conn, datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc), 1, 25, "warDay", 0)
+        db.ensure_section(conn, datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc), 1, 25, "warDay", 1)
+        db.ensure_section(conn, datetime(2026, 3, 17, 10, 0, tzinfo=timezone.utc), 1, 25, "warDay", 2)
 
         latest = db.latest_completed_war_section(conn)
-        assert db.section_key(latest["period_index"], latest["period_type"], latest["section_index"]) == "25:warDay:1"
+        assert db.section_key(latest["season_index"], latest["period_index"], latest["period_type"], latest["section_index"]) == "1:25:warDay:1"
 
     def test_latest_completed_war_section_allows_training_as_current(self):
         conn = make_conn()
-        db.ensure_section(conn, datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc), 25, "warDay", 0)
-        db.ensure_section(conn, datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc), 25, "warDay", 1)
-        db.ensure_section(conn, datetime(2026, 3, 17, 10, 0, tzinfo=timezone.utc), 25, "training", 0)
+        db.ensure_section(conn, datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc), 1, 25, "warDay", 0)
+        db.ensure_section(conn, datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc), 1, 25, "warDay", 1)
+        db.ensure_section(conn, datetime(2026, 3, 17, 10, 0, tzinfo=timezone.utc), 1, 25, "training", 0)
 
         latest = db.latest_completed_war_section(conn)
-        assert db.section_key(latest["period_index"], latest["period_type"], latest["section_index"]) == "25:warDay:1"
+        assert db.section_key(latest["season_index"], latest["period_index"], latest["period_type"], latest["section_index"]) == "1:25:warDay:1"
 
 
 class TestStoreRaceSnapshot:
@@ -129,6 +132,7 @@ class TestStoreRaceSnapshot:
         db.store_race_snapshot(
             conn,
             first_seen,
+            1,
             25,
             "warDay",
             0,
@@ -137,6 +141,7 @@ class TestStoreRaceSnapshot:
         db.store_race_snapshot(
             conn,
             second_seen,
+            1,
             25,
             "warDay",
             0,
@@ -158,6 +163,7 @@ class TestStoreMemberSnapshot:
         db.store_member_snapshot(
             conn,
             seen_at,
+            1,
             25,
             "warDay",
             0,
@@ -166,6 +172,7 @@ class TestStoreMemberSnapshot:
         db.store_member_snapshot(
             conn,
             seen_at,
+            1,
             25,
             "warDay",
             0,
@@ -195,6 +202,7 @@ class TestIngestFiles:
             ingest.DATA_DIR = str(tmp_path)
             archive_path = ingest.save_archive(
                 ts,
+                1,
                 25,
                 "warDay",
                 3,
@@ -208,7 +216,8 @@ class TestIngestFiles:
 
         payload = json.loads(Path(archive_path).read_text(encoding="utf-8"))
         assert payload["capturedAt"] == ts.isoformat()
-        assert payload["sectionKey"] == "25:warDay:3"
+        assert payload["sectionKey"] == "1:25:warDay:3"
+        assert payload["seasonIndex"] == 1
         assert payload["periodIndex"] == 25
         assert payload["members"][0]["tag"] == "#AAA"
 
@@ -250,14 +259,16 @@ class TestIngestFiles:
         ]
 
 
-SECTION = (25, "warDay", 1)
-PRIOR_SECTION = (25, "warDay", 0)
+SECTION = (1, 25, "warDay", 1)
+PRIOR_SECTION = (1, 25, "warDay", 0)
 
 
 class TestFindNonParticipants:
     def test_empty_when_no_snapshot(self):
         conn = make_conn()
-        assert find_non_participants(conn, *SECTION) == []
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members = db.get_members(conn, *SECTION)
+        assert find_non_participants(conn, *SECTION, snapshots, members) == []
 
     def test_empty_for_training_section(self):
         conn = make_conn()
@@ -270,7 +281,9 @@ class TestFindNonParticipants:
             participants=[{"tag": "#AAA", "name": "Alice", "decksUsedToday": 0}],
             members=[{"tag": "#AAA", "name": "Alice", "role": "member"}],
         )
-        assert find_non_participants(conn, 25, "training", 0) == []
+        snapshots = db.get_snapshot(conn, 1, 25, "training", 0)
+        members_rows = db.get_members(conn, 1, 25, "training", 0)
+        assert find_non_participants(conn, 1, 25, "training", 0, snapshots, members_rows) == []
 
     def test_grace_period_skips_new_member(self):
         conn = make_conn()
@@ -298,7 +311,9 @@ class TestFindNonParticipants:
             ],
         )
         # NewGuy owes 0 days (both days excused: day 1 absent + day 2 is join day).
-        result = find_non_participants(conn, *SECTION)
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        result = find_non_participants(conn, *SECTION, snapshots, members_rows)
         new_guy = [r for r in result if r["tag"] == "#NEW"]
         assert new_guy == []
 
@@ -323,7 +338,9 @@ class TestFindNonParticipants:
             members=[{"tag": "#AAA", "name": "Alice", "role": "member"}],
         )
 
-        result = find_non_participants(conn, *SECTION)
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        result = find_non_participants(conn, *SECTION, snapshots, members_rows)
         assert len(result) == 1
         assert result[0]["tag"] == "#AAA"
         assert result[0]["decks_today"] == 2
@@ -349,7 +366,9 @@ class TestFindNonParticipants:
             members=[{"tag": "#ABSENT", "name": "Absent", "role": "member"}],
         )
 
-        result = find_non_participants(conn, *SECTION)
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        result = find_non_participants(conn, *SECTION, snapshots, members_rows)
         assert result[0]["tag"] == "#ABSENT"
         assert result[0]["decks_today"] == 0
 
@@ -376,7 +395,9 @@ class TestFindNonParticipants:
                 participants=[{"tag": "#EXEMPT", "name": "Owner", "decksUsedToday": 0, "decksUsed": 0}],
                 members=[{"tag": "#EXEMPT", "name": "Owner", "role": "member"}],
             )
-            assert find_non_participants(conn, *SECTION) == []
+            snapshots = db.get_snapshot(conn, *SECTION)
+            members_rows = db.get_members(conn, *SECTION)
+            assert find_non_participants(conn, *SECTION, snapshots, members_rows) == []
         finally:
             EXEMPT_TAGS.clear()
             EXEMPT_TAGS.update(original)
@@ -414,7 +435,9 @@ class TestFindNonParticipants:
                 # Bob is not in the current roster
             ],
         )
-        result = find_non_participants(conn, *SECTION)
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        result = find_non_participants(conn, *SECTION, snapshots, members_rows)
         tags = [r["tag"] for r in result]
         assert "#BOB" not in tags  # already removed, not our problem
         assert "#AAA" in tags      # Alice is still in clan and underperformed
@@ -445,7 +468,9 @@ class TestFindNonParticipants:
                 members=members,
             )
 
-        result = find_non_participants(conn, *SECTION)
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        result = find_non_participants(conn, *SECTION, snapshots, members_rows)
         assert [row["tag"] for row in result] == ["#C", "#B", "#D", "#A"]
 
     def test_threshold_boundary(self):
@@ -465,10 +490,12 @@ class TestFindNonParticipants:
             period_index=25,
             period_type="warDay",
             section_index=1,
-            participants=[{"tag": "#AAA", "name": "Alice", "decksUsedToday": MIN_DECKS, "decksUsed": 2 * MIN_DECKS}],
+            participants=[{"tag": "#AAA", "name": "Alice", "decksUsedToday": MIN_DECKS_PER_DAY, "decksUsed": 2 * MIN_DECKS_PER_DAY}],
             members=[{"tag": "#AAA", "name": "Alice", "role": "member"}],
         )
-        assert find_non_participants(conn, *SECTION) == []
+        snapshots = db.get_snapshot(conn, *SECTION)
+        members_rows = db.get_members(conn, *SECTION)
+        assert find_non_participants(conn, *SECTION, snapshots, members_rows) == []
 
 
 class TestWarWeekendSections:
@@ -481,7 +508,7 @@ class TestWarWeekendSections:
         ]):
             store_section(conn, seen_at=seen_at, period_index=25 + i, period_type="warDay", section_index=3)
 
-        rows = db.war_weekend_sections(conn, 27, "warDay", 3)
+        rows = db.war_weekend_sections(conn, 1, 27, "warDay", 3)
         assert [(r["period_index"], r["period_type"]) for r in rows] == [
             (25, "warDay"), (26, "warDay"), (27, "warDay")
         ]
@@ -500,14 +527,14 @@ class TestWarWeekendSections:
         store_section(conn, seen_at=datetime(2026, 3, 27, 10, 0, tzinfo=timezone.utc),
                       period_index=26, period_type="warDay", section_index=3)
 
-        rows = db.war_weekend_sections(conn, 26, "warDay", 3)
+        rows = db.war_weekend_sections(conn, 1, 26, "warDay", 3)
         assert len(rows) == 2
         assert rows[0]["period_index"] == 25
         assert rows[1]["period_index"] == 26
 
     def test_returns_empty_for_unknown_section(self):
         conn = make_conn()
-        assert db.war_weekend_sections(conn, 99, "warDay", 3) == []
+        assert db.war_weekend_sections(conn, 1, 99, "warDay", 3) == []
 
 
 class TestDaysExcused:
@@ -522,7 +549,7 @@ class TestDaysExcused:
                           {"tag": "#VET",  "name": "Vet",    "role": "member"},
                           {"tag": "#NEW",  "name": "NewGuy", "role": "member"},
                       ])
-        rows = db.war_weekend_sections(conn, 26, "warDay", 3)
+        rows = db.war_weekend_sections(conn, 1, 26, "warDay", 3)
         return [r["sequence"] for r in rows]
 
     def test_veteran_has_zero_excused(self):
