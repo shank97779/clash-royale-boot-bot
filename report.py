@@ -33,6 +33,7 @@ WORST_PERFORMERS_DAYS   = int(os.getenv("WORST_PERFORMERS_DAYS",         "16"))
 WORST_PERFORMERS_SHOW   = int(os.getenv("WORST_PERFORMERS_SHOW",           "10"))
 BEST_PERFORMERS_DAYS    = int(os.getenv("BEST_PERFORMERS_DAYS",          "16"))
 BEST_PERFORMERS_SHOW    = int(os.getenv("BEST_PERFORMERS_SHOW",            "10"))
+PROMOTE_MIN_DAYS = int(os.getenv("PROMOTE_MIN_DAYS",         "8"))
 
 _env = os.getenv("ENVIRONMENT", "").strip().lower()
 if _env == "production":
@@ -309,6 +310,7 @@ def _build_lines(
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
     clan_stats: dict | None = None,
+    promo_min_days: int = PROMOTE_MIN_DAYS,
 ) -> list[str]:
     lines = [f"**Action Required — Section {section_label}**", ""]
 
@@ -340,7 +342,7 @@ def _build_lines(
     lines.append(f"**Best Performers** (last {promo_actual_days} days)")
     if promotion_candidates:
         for c in promotion_candidates:
-            action = " → Promote to Elder" if c["role"] == "member" else ""
+            action = " → Promote to Elder" if c["role"] == "member" and c["days_tracked"] >= promo_min_days else ""
             lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}] — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days){action}")
     else:
         lines.append("No promotion candidates.")
@@ -393,6 +395,7 @@ def send_discord(
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
     clan_stats: dict | None = None,
+    promo_min_days: int = PROMOTE_MIN_DAYS,
 ) -> None:
     if not DISCORD_WEBHOOK:
         print("DISCORD_WEBHOOK not set — skipping Discord send")
@@ -401,7 +404,7 @@ def send_discord(
     env_label = "PROD" if _env == "production" else "DEV"
     print(f"Sending to Discord ({env_label})...")
 
-    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats))
+    content = "\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats, promo_min_days))
     for chunk in _split_content(content):
         resp = requests.post(DISCORD_WEBHOOK, json={"content": chunk}, timeout=10)
         resp.raise_for_status()
@@ -421,8 +424,9 @@ def print_report(
     worst_actual_days: int = WORST_PERFORMERS_DAYS,
     promo_actual_days: int = WORST_PERFORMERS_DAYS,
     clan_stats: dict | None = None,
+    promo_min_days: int = PROMOTE_MIN_DAYS,
 ) -> None:
-    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats)))
+    print("\n".join(_build_lines(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days, promo_actual_days, clan_stats, promo_min_days)))
     print()
 
 
@@ -470,6 +474,13 @@ def main() -> None:
         default=BEST_PERFORMERS_SHOW,
         metavar="N",
         help=f"Number of promotion candidates to show (default: {BEST_PERFORMERS_SHOW}).",
+    )
+    parser.add_argument(
+        "--best-min-days",
+        type=int,
+        default=PROMOTE_MIN_DAYS,
+        metavar="N",
+        help=f"Minimum war days participated to be a promotion candidate (default: {PROMOTE_MIN_DAYS}).",
     )
     args = parser.parse_args()
     best_days = args.best_days
@@ -528,10 +539,10 @@ def main() -> None:
 
     promotion_candidates = best_stats[:args.best_show]
 
-    print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats)
+    print_report(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats, promo_min_days=args.best_min_days)
 
     if not args.dry_run:
-        send_discord(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats)
+        send_discord(section_label, flagged, top_performers, promotion_candidates, worst_performers, worst_actual_days=worst_actual_days, promo_actual_days=promo_actual_days, clan_stats=clan_stats, promo_min_days=args.best_min_days)
 
     conn.close()
 
