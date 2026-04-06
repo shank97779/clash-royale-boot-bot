@@ -111,7 +111,7 @@ def find_non_participants(
             action = ROLE_ACTIONS.get(m["role"], "Boot")
             first_seen = conn.execute(
                 """
-                SELECT MIN(s.sequence) AS seq
+                SELECT MIN(s.sequence) AS seq, s.first_seen_at
                 FROM section_snapshots ss
                 JOIN sections s
                   ON s.season_index  = ss.season_index
@@ -124,6 +124,7 @@ def find_non_participants(
             ).fetchone()
             first_seen_seq = first_seen["seq"] if first_seen else 0
             is_new_member  = first_seen_seq >= weekend_sequences[0]
+            member_since   = first_seen["first_seen_at"][:10] if first_seen and first_seen["first_seen_at"] else None
             flagged.append({
                 "name":           name,
                 "tag":            tag,
@@ -139,6 +140,7 @@ def find_non_participants(
                 "trophies":       m["trophies"],
                 "first_seen_seq": first_seen_seq,
                 "is_new_member":  is_new_member,
+                "member_since":   member_since,
             })
 
     flagged.sort(key=lambda c: (c["decks_used"], c["fame"]))
@@ -151,6 +153,7 @@ def find_member_fame_stats(
     section: db.SectionKey,
     num_days: int = WORST_PERFORMERS_DAYS,
     members: list | None = None,
+    member_info: dict | None = None,
 ) -> tuple[list[dict], int, float]:
     """
     Compute per-day average fame over the last num_days warDay sections for
@@ -207,6 +210,8 @@ def find_member_fame_stats(
         all_avg_fames.append(avg_fame)
         if tag.upper() in EXEMPT_TAGS:
             continue
+        first_row = None
+        member_since = (member_info or {}).get(tag.upper(), {}).get("member_since")
         stats.append({
             "name":         name,
             "tag":          tag,
@@ -215,6 +220,7 @@ def find_member_fame_stats(
             "days_tracked": len(daily),
             "avg_fame":     round(avg_fame),
             "trophies":     m["trophies"],
+            "member_since": member_since,
         })
 
     clan_avg_fame = round(sum(all_avg_fames) / len(all_avg_fames), 1) if all_avg_fames else 0.0
@@ -253,7 +259,7 @@ def _per_day_fame(conn, day_rows: list, tag: str) -> list[int]:
     return daily
 
 
-def find_top_performers(snapshots: list, trophies_by_tag: dict | None = None) -> list[list[dict]]:
+def find_top_performers(snapshots: list, member_info: dict | None = None) -> list[list[dict]]:
     """
     Returns up to three podium tiers (1st, 2nd, 3rd) by fame.
     Each tier is a list of player dicts — ties at the same fame level share a rank.
@@ -278,7 +284,8 @@ def find_top_performers(snapshots: list, trophies_by_tag: dict | None = None) ->
                 "name":    snap["player_name"],
                 "tag":     snap["player_tag"],
                 "fame":    fame,
-                "trophies": (trophies_by_tag or {}).get(snap["player_tag"].upper(), 0),
+                "trophies": (member_info or {}).get(snap["player_tag"].upper(), {}).get("trophies", 0),
+                "member_since": (member_info or {}).get(snap["player_tag"].upper(), {}).get("member_since"),
             })
 
     return tiers
@@ -286,6 +293,33 @@ def find_top_performers(snapshots: list, trophies_by_tag: dict | None = None) ->
 
 # Action groups in display order
 ACTION_ORDER = ["Boot", "Demote to Member", "Demote to Elder", "Flag for review"]
+
+
+def _joined_str(member_since: str | None) -> str:
+    if not member_since:
+        return ""
+    from datetime import date
+    days_ago = (date.today() - date.fromisoformat(member_since)).days
+    return f" [{days_ago}d]"
+
+
+def _build_member_info(conn, members: list) -> dict:
+    """Return {UPPER_TAG: {trophies, member_since}} for all members."""
+    result = {}
+    for m in members:
+        tag = m["player_tag"]
+        row = conn.execute(
+            "SELECT s.first_seen_at FROM section_snapshots ss "
+            "JOIN sections s ON s.season_index=ss.season_index AND s.period_index=ss.period_index "
+            "AND s.period_type=ss.period_type AND s.section_index=ss.section_index "
+            "WHERE ss.player_tag=? ORDER BY s.sequence ASC LIMIT 1",
+            (tag,),
+        ).fetchone()
+        result[tag.upper()] = {
+            "trophies":     m["trophies"],
+            "member_since": row["first_seen_at"][:10] if row and row["first_seen_at"] else None,
+        }
+    return result
 
 
 def _group_flagged(flagged: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -320,13 +354,17 @@ def _build_lines(
         for action, group in _group_flagged(flagged):
             lines.append(f"**{action}**")
             for c in group:
+                notes = []
                 if c['excused']:
-                    new_note = f" *(joined day {c['excused']})*" if c['is_new_member'] else f" *(absent day 1-{c['excused']})*"
+                    notes.append(f"joined day {c['excused']}" if c['is_new_member'] else f"absent day 1-{c['excused']}")
+                note_str = f" *({', '.join(notes)})*" if notes else ""
+                if c.get('member_since'):
+                    joined_str = _joined_str(c['member_since'])
                 else:
-                    new_note = ""
+                    joined_str = ""
                 lines.append(
-                    f"• **{c['name']}** [{c['trophies']:,}] — "
-                    f"{c['decks_used']}/{c['max_decks']} decks (last: {c['decks_today']}) | {c['fame']} fame{new_note}"
+                    f"• **{c['name']}** [{c['trophies']:,}]{joined_str} — "
+                    f"{c['decks_used']}/{c['max_decks']} decks (yest: {c['decks_today']}) | {c['fame']} fame{note_str}"
                 )
             lines.append("")
 
@@ -334,7 +372,9 @@ def _build_lines(
         lines.append("**Current War MVPs**")
         for i, tier in enumerate(top_performers):
             medal = PODIUM_MEDALS[i]
-            names = ", ".join(f"**{p['name']}** [{p['trophies']:,}]" for p in tier)
+            names = ", ".join(
+                f"**{p['name']}** [{p['trophies']:,}]{_joined_str(p.get('member_since'))}" for p in tier
+            )
             fame  = tier[0]["fame"]
             lines.append(f"{medal} {names} — {fame} fame")
 
@@ -343,7 +383,7 @@ def _build_lines(
     if promotion_candidates:
         for c in promotion_candidates:
             action = " → Promote to Elder" if c["role"] == "member" and c["days_tracked"] >= promo_min_days else ""
-            lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}] — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days){action}")
+            lines.append(f"⬆️ **{c['name']}** [{c['trophies']:,}]{_joined_str(c.get('member_since'))} — {c['avg_fame']:,} fame/day avg ({c['days_tracked']} days){action}")
     else:
         lines.append("No promotion candidates.")
 
@@ -352,7 +392,7 @@ def _build_lines(
         lines.append(f"**Worst Performers** (last {worst_actual_days} war days)")
         for p in worst_performers:
             lines.append(
-                f"⚠️ **{p['name']}** [{p['trophies']:,}] — "
+                f"⚠️ **{p['name']}** [{p['trophies']:,}]{_joined_str(p.get('member_since'))} — "
                 f"{p['avg_fame']:,} fame/day avg ({p['days_tracked']} days) "
                 f"→ {p['action']}"
             )
@@ -521,11 +561,11 @@ def main() -> None:
         sys.exit(1)
 
     members               = db.get_members(conn, section)
-    trophies_by_tag       = {m["player_tag"].upper(): m["trophies"] for m in members}
+    member_info           = _build_member_info(conn, members)
     flagged               = find_non_participants(conn, section, snapshots, members)
-    top_performers        = find_top_performers(snapshots, trophies_by_tag)
+    top_performers        = find_top_performers(snapshots, member_info)
     worst_stats, worst_actual_days, clan_stats = find_member_fame_stats(
-        conn, section, num_days=args.worst_days, members=members
+        conn, section, num_days=args.worst_days, members=members, member_info=member_info
     )
     worst_performers = worst_stats[:args.worst_show]
 
@@ -533,7 +573,7 @@ def main() -> None:
         best_stats, promo_actual_days = list(reversed(worst_stats)), worst_actual_days
     else:
         full_best, promo_actual_days, _ = find_member_fame_stats(
-            conn, section, num_days=best_days, members=members
+            conn, section, num_days=best_days, members=members, member_info=member_info
         )
         best_stats = list(reversed(full_best))
 
