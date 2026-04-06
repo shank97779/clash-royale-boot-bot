@@ -165,8 +165,8 @@ def _prev_warday_fame(
     ).fetchone()
     if prev is None:
         return None
-    # Different season_index or war period → fame has reset
-    if prev["season_index"] != current_period["season_index"] or prev["period_index"] != current_period["period_index"]:
+    # Different season_index → fame has reset (new CR season)
+    if prev["season_index"] != current_period["season_index"]:
         return None
     boundary = conn.execute(
         """
@@ -403,12 +403,20 @@ def store_race_snapshot(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(season_index, period_index, period_type, section_index, player_tag) DO UPDATE SET
                 player_name      = excluded.player_name,
-                fame             = excluded.fame,
+                fame             = MAX(section_snapshots.fame, excluded.fame),
                 repair_points    = excluded.repair_points,
-                boat_attacks     = excluded.boat_attacks,
-                decks_used       = excluded.decks_used,
-                decks_used_today = excluded.decks_used_today,
-                fame_today       = excluded.fame_today,
+                boat_attacks     = MAX(section_snapshots.boat_attacks, excluded.boat_attacks),
+                decks_used       = MAX(section_snapshots.decks_used, excluded.decks_used),
+                decks_used_today = CASE
+                                     WHEN excluded.decks_used >= section_snapshots.decks_used
+                                     THEN excluded.decks_used_today
+                                     ELSE section_snapshots.decks_used_today
+                                   END,
+                fame_today       = CASE
+                                     WHEN excluded.fame >= section_snapshots.fame
+                                     THEN excluded.fame_today
+                                     ELSE section_snapshots.fame_today
+                                   END,
                 pulled_at        = excluded.pulled_at
             """,
             (
