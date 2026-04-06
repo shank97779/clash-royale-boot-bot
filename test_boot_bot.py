@@ -109,7 +109,34 @@ class TestStoreRaceSnapshot:
         assert rows[0]["player_tag"] == "#AAA"
         assert rows[0]["decks_used_today"] == 4
 
-    def test_replaces_section_with_latest_raw_values(self):
+    def test_high_water_mark_preserved_when_api_resets_to_zero(self):
+        """A later snapshot with lower values (e.g. end-of-season API reset) must
+        not overwrite the previously recorded high-water-mark stats."""
+        conn = make_conn()
+        first_seen = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        second_seen = datetime(2026, 3, 15, 11, 0, tzinfo=timezone.utc)
+
+        db.store_race_snapshot(
+            conn,
+            first_seen,
+            db.SectionKey(1, 25, "warDay", 0),
+            [{"tag": "#AAA", "name": "Alice", "decksUsed": 4, "decksUsedToday": 4, "fame": 200}],
+        )
+        # API resets all stats to zero at season end — should not overwrite.
+        db.store_race_snapshot(
+            conn,
+            second_seen,
+            db.SectionKey(1, 25, "warDay", 0),
+            [{"tag": "#AAA", "name": "Alice", "decksUsed": 0, "decksUsedToday": 0, "fame": 0}],
+        )
+
+        row = conn.execute("SELECT * FROM section_snapshots WHERE player_tag = '#AAA'").fetchone()
+        assert row["decks_used"] == 4
+        assert row["fame"] == 200
+        assert row["pulled_at"] == second_seen.isoformat()
+
+    def test_updates_section_when_values_increase(self):
+        """A later snapshot with higher values (normal mid-war progress) should update."""
         conn = make_conn()
         first_seen = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
         second_seen = datetime(2026, 3, 15, 11, 0, tzinfo=timezone.utc)
@@ -124,13 +151,12 @@ class TestStoreRaceSnapshot:
             conn,
             second_seen,
             db.SectionKey(1, 25, "warDay", 0),
-            [{"tag": "#AAA", "name": "Alice", "decksUsed": 2, "decksUsedToday": 0, "fame": 100}],
+            [{"tag": "#AAA", "name": "Alice", "decksUsed": 8, "decksUsedToday": 4, "fame": 600}],
         )
 
         row = conn.execute("SELECT * FROM section_snapshots WHERE player_tag = '#AAA'").fetchone()
-        assert row["decks_used"] == 2
-        assert row["decks_used_today"] == 0
-        assert row["fame"] == 100
+        assert row["decks_used"] == 8
+        assert row["fame"] == 600
         assert row["pulled_at"] == second_seen.isoformat()
 
 
